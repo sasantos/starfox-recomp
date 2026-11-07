@@ -257,7 +257,7 @@ index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628
  HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
  HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
 diff --git a/runtime/gfx_shader.c b/runtime/gfx_shader.c
-index ec779b1b8549f76dde8f071a4ae31ceda46d7876..ebdfffcb0eb477e2bff9ca554f6897060b4b3fcf 100644
+index ec779b1b8549f76dde8f071a4ae31ceda46d7876..6f2db4521c6dc5968404a583aec43a182efdff36 100644
 --- a/runtime/gfx_shader.c
 +++ b/runtime/gfx_shader.c
 @@ -869,11 +869,25 @@ static int fmt_code(const char *name) {
@@ -289,7 +289,7 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..ebdfffcb0eb477e2bff9ca554f689706
  }
  
  static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
-@@ -904,16 +918,29 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
+@@ -904,16 +918,36 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
      r->type = (uint16_t)json_int(o, e, "type", 0);
      r->format = (uint8_t)fmt_code(buf);
      r->flags = (uint8_t)json_int(o, e, "flags", 0);
@@ -319,10 +319,17 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..ebdfffcb0eb477e2bff9ca554f689706
 +                else if (b >= ss && b < ss + 8 * ns && (b - ss) % 8 == 0) r->handle = (uint16_t)((b - ss) / 8 + 1);
 +            }
 +        }
++        if (kind == GFX_RES_TEX && r->slot < 0 && s->c0.images) {
++            // TXQ (textureSize) on a storage image handle in the NVN 2 image table: the translator emits a texture
++            // descriptor for the query while the game binds the handle in the image slot.
++            int ia = (int)nvn2_c0_part(&s->c0, 4), ni = s->c0.images;
++            if (bytes >= ia && bytes < ia + 8 * ni && (bytes - ia) % 8 == 0)
++                r->slot = (int16_t)((bytes - ia) / 8), r->flags |= 0x80;
++        }
      }
  }
  
-@@ -1135,6 +1162,23 @@ static int reflect(GfxShader *s, int flags) {
+@@ -1135,6 +1169,23 @@ static int reflect(GfxShader *s, int flags) {
                  if (*q++ != (i + 1 == n ? ']' : ',')) return 0;
              }
          }
@@ -346,7 +353,7 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..ebdfffcb0eb477e2bff9ca554f689706
          if (!nvn2_c0_valid(&s->c0, NVN2_C0_BYTES)) return 0;
          s->has_c0 = 1;
      }
-@@ -1556,6 +1600,8 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const
+@@ -1556,6 +1607,8 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const
                           GFX_STORAGE_CANDIDATES_VERSION, lay[4], lay[5], lay[6], lay[7]);
              for (int i = 0; i < NVN2_ROOT_TABLES; i++) o += sprintf(o, "%s%u", i ? "," : "", lay[12 + i]);
              o += sprintf(o, "]");
@@ -2914,6 +2921,23 @@ index 078a455a51414eb632022a25704e2e863e2e6576..c8f260363acb7910a4269292eb2cd50b
      VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                 .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                 .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
+diff --git a/runtime/vk_dump.c b/runtime/vk_dump.c
+index 1d43c98ef40e7de1e021f6c5e9c8405e94278263..14d9362bee9e78fa3bd82462c277542b7498ca00 100644
+--- a/runtime/vk_dump.c
++++ b/runtime/vk_dump.c
+@@ -606,8 +606,10 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info)
+             continue;
+         }
+         for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++) {
+-            int slot = r->slot + (int)k;
+-            uint64_t h = handle_of(ex, st, slot, img);
++            int slot = r->slot + (int)k, from_img = img || (r->flags & 0x80);
++            uint64_t h = handle_of(ex, st, slot, from_img);
++            if (!from_img && h && !(h >> 20) && r->handle > 0 && r->handle <= 128)
++                h |= ex->samp[st][r->handle - 1];
+             sp(b, "    %s %s slot %d decl %s%s: ", stn[st], img ? "img" : "tex", slot, decl_type(r->type, dt),
+                img && (r->flags & 4) ? " store" : "");
+             if (!h) { sp(b, "no handle (dummy)\n"); continue; }
 diff --git a/runtime/vk_exec.c b/runtime/vk_exec.c
 index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2aa476d650 100644
 --- a/runtime/vk_exec.c
@@ -2927,7 +2951,7 @@ index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2a
          case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
              if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
 diff --git a/runtime/vk_exec_draw.c b/runtime/vk_exec_draw.c
-index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a4f96bc65e4f6c69a05a9d9e4af693fdbffaef2d 100644
+index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..d0645ec2bfd7db875530c411a9443fc0254eceb6 100644
 --- a/runtime/vk_exec_draw.c
 +++ b/runtime/vk_exec_draw.c
 @@ -130,6 +130,10 @@ static struct {
@@ -2978,7 +3002,12 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a4f96bc65e4f6c69a05a9d9e4af693fd
                      else if (slot >= 3 && slot - 3 < 18) rs_add(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf));
                  }   // slot 1: the program (bind_sig); others: the zero buffer
              } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
-@@ -2071,6 +2093,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
+@@ -2067,10 +2089,11 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
+                 }
+             } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+                        b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+-                int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
++                int img = b->kind == GFX_RES_IMG || (r->flags & 0x80), cap = img ? 32 : 128;
                  for (uint32_t k = 0; k < cnt; k++) {
                      int slot = r->slot + (int)k;
                      if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
@@ -3051,11 +3080,17 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a4f96bc65e4f6c69a05a9d9e4af693fd
      vk_texture_lock();
      for (uint64_t o = 16; o + 8 <= len; o += 8) {
          if ((o & 31) != 16 && (o & 31) != 24) continue;
-@@ -2391,6 +2459,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
+@@ -2387,10 +2455,12 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
+                 kind = 1;
+                 vk_texture_lock();   // tex_info looks up with the texture lock held
+                 for (uint32_t k = 0; k < cnt; k++) {
+-                    int slot = r->slot + (int)k;
++                    int slot = r->slot + (int)k, from_img = img || (r->flags & 0x80);
                      uint64_t h = 0;
-                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+-                    if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
++                    if (from_img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                      else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
-+                    if (!img && h && !(h >> 20) && r->handle > 0 && r->handle <= 128)
++                    if (!from_img && h && !(h >> 20) && r->handle > 0 && r->handle <= 128)
 +                        h |= ex->samp[st][r->handle - 1];
                      tex_info(ex, r, h, img, r->separate, &o[k].image);
                      o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
