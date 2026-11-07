@@ -16,6 +16,7 @@ REFERENCE_COMMIT = "a12af268d7474b0d63a903d3a27bf1c487d0ecbe"
 PATCH_DIR = ROOT / "patches"
 RUNTIME_PATCHES = tuple(PATCH_DIR / name for name in (
     "phase1-module-window.patch", "phase2-boot.patch", "phase3-nvn.patch", "phase4-shaders.patch",
+    "phase5-mission.patch",
 ))
 PROFILE = ROOT / "config" / "starfox-base.json"
 BUILD = ROOT / "build"

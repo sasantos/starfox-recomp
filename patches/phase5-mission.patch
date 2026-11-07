@@ -1,0 +1,2276 @@
+diff --git a/recomp/simd_c.py b/recomp/simd_c.py
+index b2469984b9115c831b4f830c347fafc643ebc4b8..e7657b4e76b347b863f855b9f93f7d59f8ad52e4 100644
+--- a/recomp/simd_c.py
++++ b/recomp/simd_c.py
+@@ -3,8 +3,8 @@
+ 
+ Every encoding is decoded here at lift time and turned into C over the Cpu struct, calling the static
+ inline helpers in runtime/simd.h with constant fields (sizes, lanes, ops), so clang folds the helpers'
+-switches. Covers ARMv8.0-A + Crypto + CRC32 (the Switch's Cortex-A57); unallocated or later-architecture
+-encodings (FP16 arithmetic, RDM, dot product, FCMA, JSCVT, ...) raise Unsupported.
++switches. Covers ARMv8.0-A + Crypto + CRC32 and selected later instructions such as vector UDOT.
++Unimplemented encodings raise Unsupported.
+ """
+ from lifter import COND_NAMES, Unsupported, W, X, XS, bits, extend_expr, hx, set_reg, sext
+ 
+@@ -128,6 +128,13 @@ class SimdC:
+     # ------------------------------------------------------------ top level
+ 
+     def dp(self, w, pc):
++        if (w & 0xbfe0fc00) == 0x2e809400:  # UDOT Vd.2S/4S, Vn.8B/16B, Vm.8B/16B
++            Q, m, n, d = bits(w, 30, 1), bits(w, 16, 5), bits(w, 5, 5), bits(w, 0, 5)
++            return (f'{{ const vu8 lhs = {VR("vu8", n)}, rhs = {VR("vu8", m)}; '
++                    f'vu32 acc = {VR("vu32", d)}; '
++                    f'for (unsigned i = 0; i < {lanes(Q, 2)}; ++i) {{ '
++                    'for (unsigned j = 4 * i; j < 4 * i + 4; ++j) acc[i] += (uint32_t)lhs[j] * rhs[j]; } '
++                    f'{VWr("vu32", Q, d, "acc")} }}')
+         op0, op1, op2, op3 = bits(w, 28, 4), bits(w, 23, 2), bits(w, 19, 4), bits(w, 10, 9)
+         if op0 == 0b0100 and not (op1 & 2) and (op2 & 7) == 5 and (op3 & 0b110000011) == 0b10:
+             return self.crypto_aes(w)
+diff --git a/runtime/boot.c b/runtime/boot.c
+index 25f3432e088c7e4dfb631097c8f509b499bf0501..e3a7676905ffc1265d4295ef372a9e4ec34f85cb 100644
+--- a/runtime/boot.c
++++ b/runtime/boot.c
+@@ -3,7 +3,8 @@
+ // da35b83 (MIT, Copyright (c) 2026 Peiikai).
+ // The boot driver: the guest main thread runs the game's own nn::init::Start
+ // with three host callbacks, the second of which runs DT_INIT of main, subsdk0 and sdk; Start then calls nnMain.
+-// --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call, at the return address of
++// Star Fox --boot checks the VZIP header read and ends at the first nvnBootstrapLoader call.
++// TotK --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call, at the return address of
+ // each in main (1.1.1, 1.2.1, 1.4.3):
+ //   SetFocusHandlingMode   main+0xeb8c14 (1.2.1: +0xe7a954, 1.4.3: +0xbdb48c) in nnMain, every module's constructor
+ //                          flag reads 2
+@@ -15,6 +16,7 @@
+ #include <string.h>
+ 
+ #include "cfg.h"
++#include "dispatch.h"
+ #include "fs.h"
+ #include "gfx.h"
+ #include "nvn_api.h"
+@@ -38,6 +40,8 @@ static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk",
+ #define expected_inits (RT_V143 ? inits_143 : RT_V111 ? inits_111 : inits_121)
+ 
+ static volatile int32_t inits_done, checkpoint_seen;
++static volatile int32_t archive_seen, first_nvn_seen, boot_finished;
++static uint64_t null_submits;
+ uint64_t rt_guest_start_ns;
+ 
+ static const RtLoaded *module_named(const char *name) {
+@@ -67,8 +71,23 @@ static void check_npdm(void) {
+ 
+ // ---- the three callbacks of nn::init::Start (rtld's job on hardware)
+ static void cb_loader_ready(Cpu *c) {
+-    (void)c;
+     rt_log("boot: rtld callback: modules linked");
++    if (rt_game_version) return;
++
++    // Star Fox supports SDK fibers through its own command line. The generic ARM64 stack
++    // switch cannot carry the host C call frames used by the recompilation.
++    const char args[] = "StarFox\0-os_fibers";
++    uint64_t *argv = mem_kernel_alloc(3 * sizeof *argv + sizeof args, 16);
++    char *strings = (char *)(argv + 3);
++    memcpy(strings, args, sizeof args);
++    argv[0] = (uintptr_t)strings;
++    argv[1] = (uintptr_t)(strings + sizeof "StarFox");
++    uint64_t set_argc = ldr_symbol("_ZN2nn2os11SetHostArgcEi");
++    uint64_t set_argv = ldr_symbol("_ZN2nn2os11SetHostArgvEPPc");
++    if (!set_argc || !set_argv) rt_fatal("boot: Star Fox SDK argument setters are missing");
++    rt_call(c, set_argc, 1, (uint64_t)2);
++    rt_call(c, set_argv, 1, (uint64_t)(uintptr_t)argv);
++    rt_log("boot: Star Fox arguments: -os_fibers");
+ }
+ 
+ // DT_INIT registers the module with musl (__nnmusl_init_dso) and runs its init_array; the constructor flag reads 2
+@@ -93,6 +112,13 @@ static void cb_module_inits(Cpu *c) {
+         if (!m->init) rt_fatal("boot: %s has no DT_INIT", m->name);
+         rt_log("boot: ENTER %s DT_INIT (%llu init_array entries)", m->name, (unsigned long long)entries);
+         rt_call(c, m->init, 0);
++        if (m->deferred_tlsdesc) {
++            uint64_t resolver = LD64(m->deferred_tlsdesc);
++            const RtLoaded *sdk = module_named("sdk");
++            if (resolver - sdk->base >= sdk->text_end || !rt_dispatch_lookup(resolver))
++                rt_fatal("boot: %s DT_INIT did not install a callable SDK TLS resolver", m->name);
++            rt_log("boot: %s TLSDESC initialized by guest SDK", m->name);
++        }
+         uint32_t state = ctor_state(m);
+         rt_logf("boot: DT_INIT %s state=%u (%llu)\n", m->name, state, (unsigned long long)entries);
+         if (state != CTOR_DONE) rt_fatal("boot: %s DT_INIT left its constructor flag at %u, not 2", m->name, state);
+@@ -115,9 +141,42 @@ static void stats_line(void) {
+            (unsigned long long)s.threads, (unsigned long long)s.host_calls);
+ }
+ 
++static void finish_starfox_boot(void) {
++    if (!rt_config()->boot || rt_config()->probe_nvn_boot || rt_config()->seconds || plat_cas32(&archive_seen, 0, 0) != 1 ||
++        !plat_cas32(&first_nvn_seen, 0, 0) || plat_xchg32(&boot_finished, 1)) return;
++    stats_line();
++    fflush(stdout);
++    fflush(stderr);
++    plat_exit(0);
++}
++
++void rt_boot_nvn_submit(int handles, uint64_t fence) {
++    if (!handles) return;
++    uint64_t n = __atomic_add_fetch(&null_submits, 1, __ATOMIC_RELEASE);
++    if (n <= 8) rt_log("nvn boot: submit %llu completed (%d handles, fence %llu)",
++                       (unsigned long long)n, handles, (unsigned long long)fence);
++}
++
++void rt_boot_archive_read(uint64_t bytes) {
++    if (!plat_cas32(&archive_seen, -1, 0)) {
++        rt_log("boot: VZIP data.zip header read at offset 0 (%llu bytes)", (unsigned long long)bytes);
++        plat_xchg32(&archive_seen, 1);
++        finish_starfox_boot();
++    }
++}
++
+ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
+-    if (!rt_game_version) return;   // the expected call sites are TotK's main; Bananza has none pinned
+     char at[128];
++    if (!rt_game_version) {
++        if (!strcmp(what, "nvn")) {
++            if (!plat_cas32(&inits_done, 0, 0)) rt_fatal("boot: first NVN call before module constructors");
++            rt_log("boot: first NVN call nvnBootstrapLoader(\"%s\") from %s", detail, caller(c, at, sizeof at));
++            if (strcmp(detail, "nvnDeviceGetProcAddress")) rt_fatal("boot: unexpected first NVN procedure");
++            plat_xchg32(&first_nvn_seen, 1);
++            finish_starfox_boot();
++        }
++        return;
++    }
+     const RtLoaded *main_mod = module_named("main");
+     uint64_t ret = c->x[30];
+     caller(c, at, sizeof at);
+@@ -303,6 +362,25 @@ static void series_shot(const tex_t *t, uint64_t n) {
+ // counted by the back end only.
+ void rt_frame_presented(const tex_t *t, uint64_t n) {
+     const RtConfig *cfg = rt_config();
++    if (cfg->probe_nvn_boot) {
++        static int probe_shot_done;
++        if (cfg->shot && !probe_shot_done) {
++            probe_shot_done = 1;
++            save_shot(t, cfg->shot);
++        }
++        uint64_t submits = __atomic_load_n(&null_submits, __ATOMIC_ACQUIRE);
++        GfxStats g = gfx_stats();
++        if (submits >= 8 && g.frames >= 3 && plat_cas32(&archive_seen, 0, 0) == 1 &&
++            plat_cas32(&first_nvn_seen, 0, 0) && !plat_xchg32(&boot_finished, 1)) {
++            rt_log("nvn boot: passed (%llu nonempty submits, %llu presents, %llu NVN calls)",
++                   (unsigned long long)submits, (unsigned long long)g.frames, (unsigned long long)g.nvn_calls);
++            stats_line();
++            fflush(stdout);
++            fflush(stderr);
++            plat_exit(0);
++        }
++        return;
++    }
+     series_shot(t, n);
+     int64_t w = cfg->seconds ? frame_step_world_us() : -1;
+     if (w < 0 || (double)w < cfg->seconds * 1e6) return;
+diff --git a/runtime/fs_host.c b/runtime/fs_host.c
+index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628e50d692e 100644
+--- a/runtime/fs_host.c
++++ b/runtime/fs_host.c
+@@ -634,6 +634,13 @@ static int component_ok(const char *c, size_t n) {
+     return 1;
+ }
+ 
++static const Mount *mount_named(const char *name, size_t len) {  // under lock
++    for (int i = 0; i < NMOUNTS; i++)
++        if (mounts[i].kind && strlen(mounts[i].name) == len && !strncmp(mounts[i].name, name, len))
++            return &mounts[i];
++    return NULL;
++}
++
+ // "name:/a/b" -> host path; 0 on success; *kind = the mount's kind (M_SAVE ...) when kind is given.
+ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kind) {
+     if (!path) return FS_R_INVALID_PATH;
+@@ -643,11 +650,11 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
+     char root[1024];
+     int k = M_FREE;
+     plat_mutex_lock_shared(&lock);
+-    for (int i = 0; i < NMOUNTS; i++)
+-        if (mounts[i].kind && strlen(mounts[i].name) == n && !strncmp(mounts[i].name, path, n)) {
+-            strcpy(root, mounts[i].root);
+-            k = mounts[i].kind;
+-        }
++    const Mount *mount = mount_named(path, n);
++    if (mount) {
++        strcpy(root, mount->root);
++        k = mount->kind;
++    }
+     plat_mutex_unlock_shared(&lock);
+     if (k == M_FREE) return FS_R_PATH_NOT_FOUND;
+     if (kind) *kind = k;
+@@ -1118,6 +1125,32 @@ static void ov_open_file(Cpu *c) { ret_x(c, open_file(arg_p(c, 0), arg_p(c, 1),
+ static void ov_file_size(Cpu *c) { ret_x(c, file_size(arg_p(c, 0), arg_x(c, 1))); }
+ static void ov_close_file(Cpu *c) { close_file(arg_x(c, 0)); }
+ static void ov_entry_type(Cpu *c) { ret_x(c, entry_type(arg_p(c, 0), arg_p(c, 1))); }
++
++// nnmusl checks the mount table and the limits before fopen can call OpenFile.
++static void ov_is_path_mounted(Cpu *c) {
++    const char *path = arg_p(c, 0);
++    const char *colon = path ? strchr(path, ':') : NULL;
++    int mounted = romfs_owns(path);
++    if (!mounted && colon) {
++        plat_mutex_lock_shared(&lock);
++        mounted = mount_named(path, (size_t)(colon - path)) != NULL;
++        plat_mutex_unlock_shared(&lock);
++    }
++    ret_x(c, mounted);
++}
++
++static void ov_path_limit(Cpu *c) {
++    uint64_t *out = arg_p(c, 0);
++    if (out) *out = 0x300;
++    ret_x(c, out ? 0 : FS_R_INVALID_ARGUMENT);
++}
++
++static void ov_utf16_path_limit(Cpu *c) {
++    uint8_t *limited = arg_p(c, 0);
++    uint64_t *out = arg_p(c, 1);
++    if (limited && out) { *limited = 0; *out = 0x300; }
++    ret_x(c, limited && out ? 0 : FS_R_INVALID_ARGUMENT);
++}
+ static void ov_read_file(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
+ static void ov_read_options(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
+ static void ov_read_exact(Cpu *c) { ret_x(c, read_exact(arg_x(c, 0), I64(1), arg_p(c, 2), arg_x(c, 3))); }
+@@ -1207,6 +1240,11 @@ HOST_OVERRIDE(S_OPEN_FILE, ov_open_file);
+ HOST_OVERRIDE(S_FILE_SIZE, ov_file_size);
+ HOST_OVERRIDE(S_CLOSE_FILE, ov_close_file);
+ HOST_OVERRIDE(S_ENTRY_TYPE, ov_entry_type);
++HOST_OVERRIDE("_ZN2nn2fs13IsPathMountedEPKc", ov_is_path_mounted);
++HOST_OVERRIDE("_ZN2nn2fs16GetPathLengthMaxEPmPKc", ov_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs21GetEntryNameLengthMaxEPmPKc", ov_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs21GetUtf16PathLengthMaxEPbPmPKc", ov_utf16_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc", ov_utf16_path_limit);
+ HOST_OVERRIDE(S_READ_FILE, ov_read_file);
+ HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
+ HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
+diff --git a/runtime/host.h b/runtime/host.h
+index 24f425d1882b0eaf51d4bc24806183274bf2bc6e..480ec1d3dbf9c66f53f4ca386fe05e8cc8693bb8 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -73,12 +73,12 @@ void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if
+ 
+ // ---- guest address map (fixed part)
+ #define RT_ADDRESS_LIMIT (1ull << 39)
+-#define RT_KERNEL_BASE 0x7010000000ull
++// Star Fox's six modules occupy more than the original 256 MiB window.
++#define RT_KERNEL_BASE 0x7020000000ull
+ #define RT_KERNEL_SIZE 0x10000000ull
+-#define RT_HOSTFN_BASE 0x7020000000ull
+-// The game's application/program id (main.npdm ACI0): Donkey Kong Bananza. GetInfo 18 returns it and save data is
+-// kept for it alone.
+-#define RT_APPLICATION_ID 0x040074a01bf12000ull
++#define RT_HOSTFN_BASE (RT_KERNEL_BASE + RT_KERNEL_SIZE)
++// Star Fox base, from the ACI0 program ID in the verified main.npdm.
++#define RT_APPLICATION_ID 0x0400e88025b1a000ull
+ #define RT_HOSTFN_SIZE 0x100000ull
+ 
+ // ---- AAPCS64 argument access for host functions (section 2.2)
+@@ -130,7 +130,7 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...);         // host -> guest, sec
+                                                            // as uint64_t: cast every argument. Seals the dispatch
+                                                            // table on first use. Sets x30 = RT_RET_HOST, restores
+                                                            // x30 and pc, returns x0. Does not touch sp
+-#define RT_RET_HOST 0x70200ff000ull                        // x30 sentinel inside the host-function window; a jump to
++#define RT_RET_HOST (RT_HOSTFN_BASE + 0xff000ull)           // x30 sentinel inside the host-function window; a jump to
+                                                            // it is a named fatal
+ 
+ // ---- guest memory (memory.c)
+@@ -175,6 +175,7 @@ void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse afte
+ typedef struct {
+     const char *name; uint64_t base, size, text_end, data_off;   // text_end, data_off: offsets from base
+     uint64_t init, init_array, init_array_size, ctor_flag;  // absolute guest addresses; init_array_size in bytes
++    uint64_t deferred_tlsdesc;                           // descriptor initialized by the guest SDK's DT_INIT
+ } RtLoaded;
+ void ldr_load(const char *exefs_dir);                      // load, relocate (overrides applied), seal; once
+ int ldr_count(void);
+@@ -229,6 +230,7 @@ uint32_t kern_event_new(void);                             // writable handle
+ uint32_t kern_event_readable(uint32_t writable);
+ void kern_event_signal(uint32_t writable);
+ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear);   // guest thread only
++void kern_forget_system_event(uint64_t ev);  // the guest retains ownership of the SDK event
+ void kern_signal_system_event(uint64_t ev);                // any thread
+ int kern_svc(Cpu *c, uint32_t imm);                        // thread/sync SVCs; 1 if handled
+ uint64_t kern_now_ns(void);
+@@ -292,12 +294,14 @@ int rt_knob(const char *name, const char *def);
+ void frame_step_present(uint64_t display_ns, int interval); // nvnQueuePresentTexture: the frame's display time and
+                                                            // present interval (60 Hz ticks)
+ // ---- boot (boot.c, main.c)
+-typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds; const char *shot, *gpu; } RtConfig;
++typedef struct { const char *exefs, *romfs, *profile; int boot, probe_nvn_boot; double seconds; const char *shot, *gpu; } RtConfig;
+                                                            // romfs: directory with romfs.bin and index.json;
+                                                            // frames: --frames N (0 = no limit); shot: --shot
+                                                            // PATH; gpu: TOTK_GPU
+ const RtConfig *rt_config(void);
+ void rt_boot_event(const char *what, Cpu *c, const char *detail);   // checkpoint log; "nvn" ends --boot
++void rt_boot_archive_read(uint64_t bytes);                    // Star Fox's original reader read the VZIP signature
++void rt_boot_nvn_submit(int handles, uint64_t fence);        // after the null backend finished a submission
+ void rt_boot(void);                                        // boot.c
+ // Modes of totk.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
+ // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
+diff --git a/runtime/ipc.c b/runtime/ipc.c
+index 21f811c4ea6ee92be5c5f4ca3b45e7bdce5c4919..b455f1e44bd830f4249ccd1aa2f10acd9e769ff2 100644
+--- a/runtime/ipc.c
++++ b/runtime/ipc.c
+@@ -22,10 +22,207 @@
+ enum { T_CLOSE = 2, T_REQUEST = 4, T_CONTROL = 5, T_REQUEST_CTX = 6, T_CONTROL_CTX = 7, T_TIPC_CLOSE = 15,
+        T_TIPC_BASE = 16 };
+ 
++// In-process IPv4 loopback streams for the game's I/O wakeups. A connect can only reach a listener in this table.
++enum { BSD_FIRST_FD = 3, BSD_FDS = 64, BSD_PIPE_SIZE = 4096 };
++enum { BSD_EBADF = 9, BSD_EAGAIN = 11, BSD_EINVAL = 22, BSD_EMFILE = 24, BSD_EPIPE = 32, BSD_ENOTSUP = 95,
++       BSD_EADDRINUSE = 98, BSD_ENETDOWN = 100, BSD_ENOTCONN = 107, BSD_ECONNREFUSED = 111 };
++typedef struct { uint8_t len, family, port[2], address[4], pad[8]; } BsdAddress;
++typedef struct {
++    int used, listening, flags, peer, pending;
++    int connected;
++    uint16_t port, remote_port;
++    unsigned bytes;
++    uint8_t data[BSD_PIPE_SIZE];
++} BsdLocal;
++static BsdLocal bsd_fds[BSD_FDS];
++static PlatMutex bsd_lock = PLAT_MUTEX_INIT;
++
++static BsdLocal *bsd_fd(int fd) { // under bsd_lock
++    if (fd < BSD_FIRST_FD || fd >= BSD_FIRST_FD + BSD_FDS || !bsd_fds[fd - BSD_FIRST_FD].used) return NULL;
++    return &bsd_fds[fd - BSD_FIRST_FD];
++}
++
++static int bsd_alloc(void) {
++    for (int i = 0; i < BSD_FDS; i++) if (!bsd_fds[i].used) {
++        bsd_fds[i] = (BsdLocal){.used = 1};
++        return BSD_FIRST_FD + i;
++    }
++    return -BSD_EMFILE;
++}
++
++static int bsd_port_in_use(uint16_t port) {
++    for (int i = 0; i < BSD_FDS; i++) if (bsd_fds[i].used && bsd_fds[i].port == port) return 1;
++    return 0;
++}
++
++static uint16_t bsd_ephemeral(void) {
++    for (unsigned port = 49152; port < 49152 + BSD_FDS; port++)
++        if (!bsd_port_in_use((uint16_t)port)) return (uint16_t)port;
++    return 0;
++}
++
++static IpcBuffer bsd_buffer(const IpcRequest *rq, int out) {
++    if (out) return rq->nb && rq->b[0].size ? rq->b[0] : rq->nc ? rq->c[0] : (IpcBuffer){0};
++    return rq->na && rq->a[0].size ? rq->a[0] : rq->nx ? rq->x[0] : (IpcBuffer){0};
++}
++
++static void bsd_output(const IpcRequest *rq, IpcResponse *rs, IpcBuffer out, const void *src, unsigned size) {
++    if (!size) return;
++    memcpy(ipc_guest(out.addr, size), src, size);
++    if (!rq->nb || !rq->b[0].size) rs->xout[rs->nxout++] = (IpcBuffer){out.addr, size, 0};
++}
++
++static int bsd_endpoint(const IpcRequest *rq, BsdLocal *socket) {
++    IpcBuffer in = bsd_buffer(rq, 0);
++    if (in.size < sizeof(BsdAddress)) return -BSD_EINVAL;
++    BsdAddress addr;
++    memcpy(&addr, ipc_guest(in.addr, sizeof addr), sizeof addr);
++    const uint8_t localhost[4] = {127, 0, 0, 1}, wildcard[4] = {0};
++    int bind = rq->cmd == 13;
++    if (addr.family != 2 || (memcmp(addr.address, localhost, 4) && (!bind || memcmp(addr.address, wildcard, 4))))
++        return -BSD_ENETDOWN;
++    uint16_t port = (uint16_t)((addr.port[0] << 8) | addr.port[1]);
++    if (bind) {
++        if (socket->port) return -BSD_EINVAL;
++        if (!port) port = bsd_ephemeral();
++        if (!port || bsd_port_in_use(port)) return -BSD_EADDRINUSE;
++        socket->port = port;
++        return 0;
++    }
++    if (socket->connected || socket->listening) return -BSD_EINVAL;
++    BsdLocal *listener = NULL;
++    for (int i = 0; i < BSD_FDS; i++)
++        if (bsd_fds[i].listening && bsd_fds[i].port == port) { listener = &bsd_fds[i]; break; }
++    if (!listener || listener->pending) return -BSD_ECONNREFUSED;
++    if (!socket->port) socket->port = bsd_ephemeral();
++    if (!socket->port) return -BSD_EADDRINUSE;
++    int child_fd = bsd_alloc();
++    if (child_fd < 0) return child_fd;
++    BsdLocal *child = bsd_fd(child_fd);
++    socket->peer = child_fd;
++    socket->connected = child->connected = 1;
++    socket->remote_port = child->port = port;
++    child->remote_port = socket->port;
++    child->peer = (int)(socket - bsd_fds) + BSD_FIRST_FD;
++    listener->pending = child_fd;
++    return 0;
++}
++
++static void bsd_close(BsdLocal *socket) {
++    BsdLocal *child = bsd_fd(socket->pending);
++    if (child) bsd_close(child);
++    BsdLocal *peer = bsd_fd(socket->peer);
++    if (peer) peer->peer = 0;
++    *socket = (BsdLocal){0};
++}
++
++static int bsd_local(const IpcRequest *rq, IpcResponse *rs, uint32_t *address_len) {
++    unsigned cmd = rq->cmd;
++    if (cmd == 2 || cmd == 3) {
++        uint32_t family = IPC_ARG(rq, uint32_t, 0), type = IPC_ARG(rq, uint32_t, 4), proto = IPC_ARG(rq, uint32_t, 8);
++        return family == 2 && type == 1 && (!proto || proto == 6) ? bsd_alloc() : -BSD_ENETDOWN;
++    }
++    BsdLocal *socket = bsd_fd(IPC_ARG(rq, int32_t, 0));
++    if (!socket) return -BSD_EBADF;
++    switch (cmd) {
++    case 13: case 14: return bsd_endpoint(rq, socket);
++    case 12: case 15: case 16: { // Accept, GetPeerName, GetSockName
++        int accepted = 0;
++        if (cmd == 12) {
++            accepted = socket->pending;
++            if (!accepted) return -BSD_EAGAIN;
++            socket->pending = 0;
++            socket = bsd_fd(accepted);
++        }
++        if (cmd == 15 && !socket->connected) return -BSD_ENOTCONN;
++        uint16_t port = cmd == 16 ? socket->port : socket->remote_port;
++        BsdAddress addr = {sizeof addr, 2, {port >> 8, port & 255}, {127, 0, 0, 1}, {0}};
++        IpcBuffer out = bsd_buffer(rq, 1);
++        bsd_output(rq, rs, out, &addr, out.size < sizeof addr ? (unsigned)out.size : sizeof addr);
++        *address_len = sizeof addr;
++        return accepted;
++    }
++    case 18: // Listen
++        if (!socket->port || socket->connected) return -BSD_EINVAL;
++        socket->listening = 1;
++        return 0;
++    case 20: { // F_GETFL / F_SETFL
++        int command = IPC_ARG(rq, int32_t, 4);
++        if (command == 3) return socket->flags;
++        if (command != 4) return -BSD_ENOTSUP;
++        socket->flags = IPC_ARG(rq, int32_t, 8);
++        return 0;
++    }
++    case 21: return 0; // packet tuning has no effect on the in-process byte stream
++    case 26: bsd_close(socket); return 0;
++    case 10: case 24: { // Send / Write
++        BsdLocal *peer = bsd_fd(socket->peer);
++        if (!peer) return socket->connected ? -BSD_EPIPE : -BSD_ENOTCONN;
++        IpcBuffer in = bsd_buffer(rq, 0);
++        unsigned room = BSD_PIPE_SIZE - peer->bytes;
++        unsigned size = in.size < room ? (unsigned)in.size : room;
++        if (!size) return in.size ? -BSD_EAGAIN : 0;
++        memcpy(peer->data + peer->bytes, ipc_guest(in.addr, size), size);
++        peer->bytes += size;
++        return (int)size;
++    }
++    case 8: case 25: { // Recv / Read
++        if (!socket->connected) return -BSD_ENOTCONN;
++        IpcBuffer out = bsd_buffer(rq, 1);
++        if (!socket->bytes) return socket->peer && out.size ? -BSD_EAGAIN : 0;
++        unsigned size = out.size < socket->bytes ? (unsigned)out.size : socket->bytes;
++        bsd_output(rq, rs, out, socket->data, size);
++        socket->bytes -= size;
++        memmove(socket->data, socket->data + size, socket->bytes);
++        return (int)size;
++    }
++    default: return -BSD_ENOTSUP;
++    }
++}
++
++static void bsd_offline_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
++    static int32_t registered;
++    const uint64_t client = 1;  // The host has one guest process.
++    switch (rq->cmd) {
++    case 0: // RegisterClient
++        plat_xchg32(&registered, 1);
++        IPC_OUT(rs, client);
++        return;
++    case 36: { // Switch 2 registration returns a 32-bit BSD status.
++        if (!rq->has_pid || rq->data_size != 16) ipc_unimplemented(s, rq);
++        const uint32_t status = 0;
++        plat_xchg32(&registered, 1);
++        IPC_OUT(rs, status);
++        return;
++    }
++    case 1: { // StartMonitoring (the Switch 2 client passes zero).
++        uint64_t id = IPC_ARG(rq, uint64_t, 0);
++        if (!plat_cas32(&registered, 0, 0) || (id != 0 && id != client))
++            rs->result = IPC_R_BAD_HANDLE;
++        return;
++    }
++    case 2: case 3: case 8: case 10: case 12: case 13: case 14: case 15: case 16:
++    case 18: case 20: case 21: case 24: case 25: case 26: {
++        uint32_t address_len = 0;
++        plat_mutex_lock(&bsd_lock);
++        int value = bsd_local(rq, rs, &address_len);
++        plat_mutex_unlock(&bsd_lock);
++        const int32_t result[2] = {value < 0 ? -1 : value, value < 0 ? -value : 0};
++        IPC_OUT(rs, result);
++        if (rq->cmd == 12 || rq->cmd == 15 || rq->cmd == 16) IPC_OUT(rs, address_len);
++        if (rt_trace & RT_TRACE_IPC) rt_log("bsd: command %u returned %d (errno %d)", rq->cmd, result[0], result[1]);
++        return;
++    }
++    default: ipc_unimplemented(s, rq);
++    }
++}
++
+ // Services sm: hands out. Anything else is a named fatal.
+ static const struct { const char *name; IpcHandler handler; } services[] = {
+     {"audren:u", audren_manager_handler},
+     {"aud:u", aud_user_handler},   // Switch 2: the way the SDK reaches audren:u
++    {"bsd:s", bsd_offline_handler},
++    {"bsd:u", bsd_offline_handler},
+ };
+ 
+ static volatile int32_t g_live;
+@@ -39,7 +236,7 @@ uint64_t ipc_sessions_released(void) { return (uint64_t)plat_cas64(&g_released,
+ uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state)) {
+     IpcSession *s = calloc(1, sizeof *s);
+     if (!s) rt_fatal("ipc: session allocation");
+-    *s = (IpcSession){name, handler, state, close, 1};
++    *s = (IpcSession){.name = name, .handler = handler, .state = state, .close = close, .refs = 1};
+     plat_inc32(&g_live);
+     return kern_handle_new(KERN_SESSION, s);
+ }
+@@ -166,7 +363,7 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
+     if ((const uint8_t *)recv - (const uint8_t *)m > IPC_MSG_BYTES) rt_fatal("ipc: request exceeds the message buffer");
+ }
+ 
+-static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
++static void respond(uint32_t *m, int tipc, int domain, const IpcResponse *rs) {
+     uint32_t out[IPC_MSG_BYTES / 4];
+     memset(out, 0, sizeof out);
+     unsigned special = rs->ncopy || rs->nmove;
+@@ -185,6 +382,7 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+     uint8_t *words = (uint8_t *)p, *payload;
+     unsigned header = tipc ? 4 : 16;
+     payload = tipc ? words : (uint8_t *)out + (((words - (uint8_t *)out) + 15) & ~15);
++    if (domain) payload += 16;   // Domain response header, zero output objects.
+     unsigned used = (unsigned)(payload - words) + header + rs->data_size;
+     unsigned nwords = tipc ? (used + 3) / 4 : (used + 16 + 3) / 4;   // CMIF keeps alignment slack like libnx
+     if ((size_t)(words - (uint8_t *)out) + nwords * 4 > IPC_MSG_BYTES) rt_fatal("ipc: response exceeds the message buffer");
+@@ -199,15 +397,22 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+     memcpy(m, out, IPC_MSG_BYTES);
+ }
+ 
+-// CMIF control requests. Domains are not implemented: MNG boots 1.2.1 without them.
++// The offline BSD service uses a single root CMIF domain object.
+ static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+     switch (rq->cmd) {
++    case 0:
++        if (s->handler == bsd_offline_handler && plat_cas32(&s->domain, 1, 0) == 0) {
++            const uint32_t id = 1;
++            IPC_OUT(rs, id);
++            return;
++        }
++        break;
+     case 3: { uint16_t n = POINTER_BUFFER_SIZE; IPC_OUT(rs, n); return; }   // QueryPointerBufferSize
+     case 2: case 4: rs->move[rs->nmove++] = session_clone(s); return;          // CloneCurrentObject(Ex)
+-    default:
+-        ipc_backtrace();
+-        rt_fatal("ipc: %s control command %u is not implemented (domains are not served)", s->name, rq->cmd);
++    default: break;
+     }
++    ipc_backtrace();
++    rt_fatal("ipc: %s control command %u is not implemented", s->name, rq->cmd);
+ }
+ 
+ static void dispatch(IpcSession *s, uint32_t *m) {
+@@ -220,6 +425,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+     IpcResponse rs;
+     memset(&rs, 0, sizeof rs);
+     int tipc = rq.type >= T_TIPC_BASE;
++    int domain = 0;
+     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
+     if (tipc) {
+         rq.cmd = rq.type - T_TIPC_BASE;
+@@ -228,10 +434,30 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+     } else if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX || rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) {
+         const uint8_t *payload = (const uint8_t *)m + (((bytes - (const uint8_t *)m) + 15) & ~15);
+         uint32_t h[4];
++        if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX) {
++            int state = plat_cas32(&s->domain, 0, 0);
++            if (state < 0) rt_fatal("ipc: %s domain is closed", s->name);
++            if (state) {
++                if (end - payload < 16) rt_fatal("ipc: truncated %s domain header", s->name);
++                memcpy(h, payload, 16);
++                if (h[1] != 1 || (h[0] & 0xff00)) rt_fatal("ipc: %s unknown domain object", s->name);
++                if ((h[0] & 0xff) == 2) {
++                    plat_xchg32(&s->domain, -1);
++                    return;
++                }
++                unsigned size = h[0] >> 16;
++                payload += 16;
++                if ((h[0] & 0xff) != 1 || size < 16 || end - payload < size)
++                    rt_fatal("ipc: %s invalid domain payload", s->name);
++                end = payload + size;
++                domain = 1;
++            }
++        }
++        if (end - payload < 16) rt_fatal("ipc: truncated %s CMIF header", s->name);
+         memcpy(h, payload, 16);
+         if (h[0] != CMIF_IN_MAGIC) {
+             ipc_backtrace();
+-            rt_fatal("ipc: %s: CMIF magic %#x (domain sessions are not served)", s->name, h[0]);
++            rt_fatal("ipc: %s: CMIF magic %#x", s->name, h[0]);
+         }
+         rq.cmd = h[2];
+         rq.data = payload + 16;
+@@ -252,7 +478,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+                tipc ? "tipc" : rq.type == T_CONTROL || rq.type == T_CONTROL_CTX ? "control" : "cmd", rq.cmd,
+                rs.result, rs.ncopy, rs.nmove, t_req ? ldr_describe(t_req->x[30], d, sizeof d) : "host");
+     }
+-    respond(m, tipc, &rs);
++    respond(m, tipc, domain, &rs);
+ }
+ 
+ // ---- sm: service manager (CMIF, and TIPC as the SDK's sm client speaks it since 12.0.0)
+diff --git a/runtime/ipc.h b/runtime/ipc.h
+index 83e07965215781c4b30d917451bc1c9d91cd8b80..feb6a681b17894de7ba61a7f613dea2d3785a4ac 100644
+--- a/runtime/ipc.h
++++ b/runtime/ipc.h
+@@ -47,6 +47,7 @@ struct IpcSession {
+     void *state;
+     void (*close)(void *state);
+     int32_t refs;
++    int32_t domain;  // 0: session, 1: root domain object, -1: root closed
+ };
+ 
+ uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle
+diff --git a/runtime/kernel.c b/runtime/kernel.c
+index cd55b791a71347525e82880b67c40ccd7cd060a3..c553f8e2257ab8dd3f064acf37f10f6df5796712 100644
+--- a/runtime/kernel.c
++++ b/runtime/kernel.c
+@@ -2086,12 +2086,9 @@ static uint32_t se_find(uint64_t ev) {
+ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
+     if (se_find(ev)) return;
+     if (!tcur || !c) rt_fatal("kern_bind_system_event(%#llx) on a host thread", (unsigned long long)ev);
+-    static uint64_t create, getw;
+-    if (!create) {
+-        create = ldr_symbol("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
+-        getw = ldr_symbol("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE");
+-        if (!create || !getw) rt_fatal("kern_bind_system_event: the SDK's system event functions are not loaded");
+-    }
++    uint64_t create = ldr_symbol("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
++    uint64_t getw = ldr_symbol("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE");
++    if (!create || !getw) rt_fatal("kern_bind_system_event: the SDK's system event functions are not loaded");
+     uint32_t r = (uint32_t)rt_call(c, create, 3, ev, (uint64_t)(autoclear ? 1 : 0), (uint64_t)1);
+     if (r) rt_fatal("kern_bind_system_event: CreateSystemEvent(%#llx) failed %#x", (unsigned long long)ev, r);
+     uint32_t wh = (uint32_t)rt_call(c, getw, 1, ev);
+@@ -2102,6 +2099,16 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
+     plat_mutex_unlock(&g_se_lock);
+ }
+ 
++void kern_forget_system_event(uint64_t ev) {
++    if (!ev) return;
++    plat_mutex_lock(&g_se_lock);
++    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) {
++        g_se[i] = g_se[--g_nse];
++        break;
++    }
++    plat_mutex_unlock(&g_se_lock);
++}
++
+ // An event not bound yet is bound on the spot with manual clear, which needs a guest thread.
+ void kern_signal_system_event(uint64_t ev) {
+     uint32_t wh = se_find(ev);
+@@ -2147,6 +2154,8 @@ __attribute__((noinline)) static RtThread *tcur_fresh(void) { return tcur; }
+ // After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber.
+ __attribute__((noinline)) static void fiber_resumed(void) {
+     RtThread *t = tcur;
++    if (!rt_game_version)
++        ST64((uintptr_t)t->tlr + TLR_SIZE + 0x70, t->fiber ? t->fiber->addr : 0);
+     rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (platform.h fibers switch it)
+     if (t->leaving) {
+         __atomic_store_n(&t->leaving->running, 0, __ATOMIC_RELEASE);
+@@ -2234,6 +2243,14 @@ void kern_fiber_initialize(Cpu *c) {
+     f->running = 0;
+     f->host = plat_fiber_new(HOST_STACK, fiber_main, f);
+     if (!f->host) rt_fatal("kernel: cannot create a host fiber");
++    if (!rt_game_version) {
++        // Star Fox identifies engine fibers by their entry/argument. SDK stack diagnostics read the bounds.
++        ST64(addr + 0x28, f->func);
++        ST64(addr + 0x30, f->arg);
++        ST64(addr + 0x38, f->stack);
++        ST64(addr + 0x40, f->stack);
++        ST64(addr + 0x48, f->size);
++    }
+ }
+ 
+ // FinalizeFiber(x0 FiberType*)
+diff --git a/runtime/loader.c b/runtime/loader.c
+index 8e7aecd7ac23355e515022bac668197df6e36edd..d9494d1d11a8898bcb9eee022b6afb3bc3a8a6b6 100644
+--- a/runtime/loader.c
++++ b/runtime/loader.c
+@@ -20,7 +20,7 @@ uint64_t hostfn_register_observer(const char *name, GuestFn fn, uint64_t origina
+ enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
+        DT_INIT = 12, DT_FINI = 13, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
+        DT_FINI_ARRAYSZ = 28, DT_RELRSZ = 0x23, DT_RELR = 0x24, DT_GNU_HASH = 0x6ffffef5 };
+-enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027 };
++enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027, R_TLSDESC = 1031 };
+ enum { K_RELATIVE, K_ABS64, K_GLOB_DAT, K_JUMP_SLOT, K_COUNT };
+ enum { STB_WEAK = 2, STT_FUNC = 2 };
+ 
+@@ -356,6 +356,16 @@ static void relocate_table(Mod *m, const Elf64Rela *r, uint64_t n) {
+         if (r[i].off < m->pub.data_off || r[i].off > m->pub.size - 8)
+             rt_fatal("loader: %s relocation %llu writes +%#llx, outside the data segment", m->pub.name,
+                      (unsigned long long)i, (unsigned long long)r[i].off);
++        if (type == R_TLSDESC && !strcmp(m->pub.name, "subsdk2") && r[i].off == 0x962698 && !si && !r[i].addend) {
++            // The verified Star Fox SDK handles this local TLS descriptor in __nnmusl_init_dso.
++            // Keep both words in their original state until that code registers the DSO's TLS template.
++            uint64_t address = base + r[i].off;
++            if (m->pub.deferred_tlsdesc || r[i].off > m->pub.size - 16 || LD64(address) || LD64(address + 8))
++                rt_fatal("loader: unexpected Star Fox TLS descriptor state");
++            m->pub.deferred_tlsdesc = address;
++            rt_log("loader: %s +%#llx TLSDESC deferred to guest DT_INIT", m->pub.name, (unsigned long long)r[i].off);
++            continue;
++        }
+         uint64_t v;
+         if (type == R_RELATIVE) {
+             m->kinds[K_RELATIVE]++;
+diff --git a/runtime/main.c b/runtime/main.c
+index a32402c8f5d67c8ae57ad2021ca53fe8ec1baaf4..80de3816be50a62f2884a144ac7f838fc5f74a7c 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -440,7 +440,7 @@ static int selftest(void) {
+ static int usage(const char *argv0) {
+     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
+                     "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
+-                    "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
++                    "--probe-nvn | --probe-nvn-boot | --probe-vulkan-boot | --probe-nvn-tex | --probe-window | --probe-shader | --probe-shader-geometry | --probe-vkmem | "
+                     "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
+     return 2;
+ }
+@@ -516,7 +516,7 @@ int main(int argc, char **argv) {
+             return usage(argv[0]);
+         }
+     }
+-    if (cfg.shot && !cfg.seconds) return usage(argv[0]);
++    if (cfg.shot && !cfg.seconds && (!mode || (strcmp(mode, "--probe-nvn-boot") && strcmp(mode, "--probe-vulkan-boot")))) return usage(argv[0]);
+     if (cfg.seconds && mode) return usage(argv[0]);
+     log_open(!mode);
+     if (!mode) {
+@@ -556,5 +556,13 @@ int main(int argc, char **argv) {
+     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
+     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+     if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
++    if (!strcmp(mode, "--probe-nvn-boot") || !strcmp(mode, "--probe-vulkan-boot")) {
++        if (rt_game_version) rt_fatal("%s requires the Star Fox build", mode);
++        cfg.boot = cfg.probe_nvn_boot = 1;
++        if (!strcmp(mode, "--probe-vulkan-boot")) cfg.gpu = "vulkan";
++        else if (!cfg.gpu) cfg.gpu = "null";
++        rt_boot();
++        return 0;
++    }
+     return usage(argv[0]);
+ }
+diff --git a/runtime/memory.c b/runtime/memory.c
+index 27ac13d2775a12b745cd3e5f0135b73a43761ced..20a58e7a3d828bf32b42b0e4daa98e5c7286a486 100644
+--- a/runtime/memory.c
++++ b/runtime/memory.c
+@@ -328,6 +328,12 @@ static int module_data(uint64_t a, uint64_t n) {
+     return off >= m->data_off && n <= m->size - off ? i : -1;
+ }
+ 
++static int stack_source_overlaps(uint64_t a, uint64_t n) {   // under lock
++    for (unsigned i = 0; i < nstack_maps; i++)
++        if (overlaps(a, n, stack_maps[i].src, stack_maps[i].size)) return 1;
++    return 0;
++}
++
+ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
+     if (a & (PAGE - 1)) return R_INVALID_ADDRESS;
+     if (!n || (n & (PAGE - 1))) return R_INVALID_SIZE;
+@@ -336,6 +342,10 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
+     if (i < 0) return R_INVALID_STATE;
+     const RtLoaded *m = ldr_module(i);
+     plat_mutex_lock(&lock);
++    if (stack_source_overlaps(a, n)) {
++        plat_mutex_unlock(&lock);
++        return R_INVALID_STATE;
++    }
+     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
+     for (uint64_t p = 0; p < n / PAGE; p++)
+         if (t[p] & ATTR_PERMISSION_LOCKED) {
+@@ -359,14 +369,18 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
+     if (i < 0) return R_INVALID_STATE;
+     const RtLoaded *m = ldr_module(i);
+     plat_mutex_lock(&lock);
++    if (stack_source_overlaps(a, n)) {
++        plat_mutex_unlock(&lock);
++        return R_INVALID_STATE;
++    }
+     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
+     for (uint64_t p = 0; p < n / PAGE; p++) t[p] |= ATTR_PERMISSION_LOCKED;
+     plat_mutex_unlock(&lock);
+     return R_OK;
+ }
+ 
+-// ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap or alias into the stack region by copy; the
+-// source is inaccessible while moved and gets the contents back on unmap.
++// ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap, alias or writable module data by copy.
++// The source is inaccessible while moved and gets the contents back on unmap.
+ static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
+     uint64_t first = (a - L.alias.base) / PAGE;
+     for (uint64_t i = 0; i < n / PAGE; i++)
+@@ -377,12 +391,12 @@ static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
+ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
+     if (!n || ((dst | src | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
+     if (!inside(dst, n, L.stack)) return R_INVALID_REGION;
+-    int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
+     int in_alias = inside(src, n, L.alias);
+-    if (!in_heap && !in_alias) return R_INVALID_REGION;
++    int mod = module_data(src, n);
+     plat_mutex_lock(&lock);
+     uint32_t r = R_OK;
+-    if (in_alias && !alias_all_mapped(src, n)) {
++    int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
++    if ((!in_heap && !in_alias && mod < 0) || (in_alias && !alias_all_mapped(src, n))) {
+         r = R_INVALID_REGION;
+         goto out;
+     }
+@@ -399,6 +413,15 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
+         decommit(dst, n, "moved stack");
+         stack_maps[found] = stack_maps[--nstack_maps];
+     } else {
++        if (mod >= 0) {
++            uint64_t off = src - ldr_module(mod)->base;
++            for (uint64_t p = 0; p < n; p += PAGE) {
++                if (module_page_perm(mod, off + p) != PERM_RW) {
++                    r = R_INVALID_STATE;
++                    goto out;
++                }
++            }
++        }
+         if (nstack_maps == MAX_STACK_MAPS) {
+             r = R_INVALID_STATE;
+             goto out;
+@@ -559,7 +582,7 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
+         r.state = ST_CODE;
+         r.perm = PERM_RX;
+     }
+-    // Moved stacks: the destination is Stack, the source Normal without access; free and normal regions around them
++    // Moved stacks: the destination is Stack, the source keeps its state without access; adjacent regions
+     // are clipped (MNG services.c).
+     for (unsigned i = 0; i < nstack_maps; i++) {
+         const StackMap *m = &stack_maps[i];
+@@ -569,11 +592,11 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
+             break;
+         }
+         if (a >= m->src && a < send) {
+-            r = (RtMemoryInfo){.base = m->src, .size = m->size, .state = ST_NORMAL, .perm = PERM_NONE, .attr = 4};
++            r = (RtMemoryInfo){.base = m->src, .size = m->size, .state = r.state, .perm = PERM_NONE, .attr = 4};
+             break;
+         }
+         uint64_t lo = r.base, hi = r.base + r.size;
+-        uint64_t b = r.state == ST_FREE ? m->dst : r.state == ST_NORMAL ? m->src : 0;
++        uint64_t b = r.state == ST_FREE ? m->dst : (r.state == ST_NORMAL || r.state == ST_CODEDATA) ? m->src : 0;
+         uint64_t e = b + m->size;
+         if (!b) continue;
+         if (e <= a && e > lo) lo = e;
+diff --git a/runtime/nvn_api.h b/runtime/nvn_api.h
+index 20285bc6248a670d6f9d3f96ba49fd0cc29f0dc9..bca65c57d6aadefcf03fff2d3b8437397ca6bb32 100644
+--- a/runtime/nvn_api.h
++++ b/runtime/nvn_api.h
+@@ -86,6 +86,8 @@ typedef struct { int32_t bits, pad; } p_barrier;           // OP_BARRIER: NVNbar
+ // OP_WAIT_SYNC retains the source until submit preparation, as the SDK's control record does. The caller keeps
+ // the sync alive through each submit; the backend never dereferences it after preparation returns.
+ typedef struct { const sync_t *sync; } p_wait_sync;
++typedef struct { sync_t *sync; } p_fence_sync;
++void nvn_submit_publish_fences(const uint64_t *handles, int n, uint64_t fence);
+ typedef struct { uint64_t target; } p_jump;                // OP_JUMP / OP_CALL: next record / called recording
+ // OP_DRAW_IDX_IND: DrawElementsIndirect; ind = GPU address of {count, instances, first index, base vertex, base
+ // instance} (VkDrawIndexedIndirectCommand's layout), read by the GPU when the draw runs
+diff --git a/runtime/nvn_api_cmd.c b/runtime/nvn_api_cmd.c
+index 3b316cbe95d3e99eeb401fb2663a83e235298e55..fed21fe96b47fc90017ea41591153f8067745ee2 100644
+--- a/runtime/nvn_api_cmd.c
++++ b/runtime/nvn_api_cmd.c
+@@ -924,6 +924,31 @@ NVN_API(nvnCommandBufferWaitSync) {
+     REC(o, OP_WAIT_SYNC, p_wait_sync)->sync = arg_p(c, 1);
+     hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
+ }
++
++static int32_t has_recorded_fences;
++NVN_API(nvnCommandBufferFenceSync) {
++    cmd_t *o = cmd_of(c);
++    sync_t *s = arg_p(c, 1);
++    if (!s || s->magic != MAGIC('S', 'Y', 'N', 'C')) rt_fatal("nvn: invalid CommandBufferFenceSync object");
++    REC(o, OP_FENCE_SYNC, p_fence_sync)->sync = s;
++    __atomic_store_n(&has_recorded_fences, 1, __ATOMIC_RELEASE);
++    hw_fix(o, 0);
++}
++
++// Fencing the whole submitted batch is conservative for both NVN conditions. Publish before returning to the guest,
++// including when the backend queued replay asynchronously. Backends leave this CPU-side record alone.
++void nvn_submit_publish_fences(const uint64_t *handles, int n, uint64_t fence) {
++    if (!__atomic_load_n(&has_recorded_fences, __ATOMIC_ACQUIRE)) return;
++    for (int i = 0; i < n; i++) {
++        for (const op_hdr *h = nvn_op_first(handles[i]); h->op != OP_END; h = nvn_op_next(h)) {
++            if (h->op != OP_FENCE_SYNC) continue;
++            sync_t *s = ((const p_fence_sync *)nvn_op_payload(h))->sync;
++            if (s->magic != MAGIC('S', 'Y', 'N', 'C')) rt_fatal("nvn: FenceSync submitted after the sync was finalized");
++            __atomic_store_n(&s->fence, fence, __ATOMIC_RELAXED);
++            __atomic_store_n(&s->fenced, 1, __ATOMIC_RELEASE);
++        }
++    }
++}
+ // Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
+ // scratch memory and the tessellation patch size have no host counterpart the replay needs.
+ // void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
+@@ -939,8 +964,7 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
+ // as soon as the submit returns). The result is written into the recording copy.
+ static uint64_t def_reads, def_changed, n_clones;
+ 
+-// Only QueueFenceSync and window acquire currently produce syncs: both name work outside this submission that is
+-// already queued (or complete). Recorded FenceSync and imported/external producers remain unimplemented.
++// Waits on external producers see their last submitted fence. The batch's own signals are published after enqueue.
+ // Waiting for their maximum before the whole batch is conservative: it orders CPU completion callbacks as well
+ // as GPU work before *any* deferred read or backend snapshot, including those before a wait in another handle.
+ static uint64_t wait_target(const uint8_t *p, int depth) {
+@@ -967,12 +991,10 @@ static uint64_t wait_target(const uint8_t *p, int depth) {
+             if (h.size < 8 + sizeof(p_wait_sync)) rt_fatal("nvn: short WaitSync record at %p", (const void *)p);
+             const sync_t *source = ((const p_wait_sync *)(const void *)(p + 8))->sync;
+             if (!source) rt_fatal("nvn: CommandBufferWaitSync with a null sync");
+-            sync_t snapshot;
+-            memcpy(&snapshot, source, sizeof snapshot);   // one value-at-submit read; never reread while waiting
+-            if (snapshot.magic != MAGIC('S', 'Y', 'N', 'C') ||
+-                (snapshot.fenced != 0 && snapshot.fenced != 1 && snapshot.fenced != 3))
++            uint32_t fenced = __atomic_load_n(&source->fenced, __ATOMIC_ACQUIRE);
++            if (source->magic != MAGIC('S', 'Y', 'N', 'C') || (fenced != 0 && fenced != 1 && fenced != 3))
+                 rt_fatal("nvn: CommandBufferWaitSync with an invalid sync state");
+-            if (snapshot.fenced) value = snapshot.fence;   // an unfenced SDK sync emits no GPU wait
++            if (fenced) value = __atomic_load_n(&source->fence, __ATOMIC_RELAXED);
+         }
+         if (value > target) target = value;
+         p += h.size;
+@@ -1105,7 +1127,7 @@ const char *nvn_op_name(uint32_t op) {
+         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
+         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
+         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
+-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC", "DRAW_MESH_IND", "DRAW_MESH",
++        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC", "DRAW_MESH_IND", "DRAW_MESH", "FENCE_SYNC",
+     };
+     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
+     return op < OP_COUNT_ ? names[op] : "?";
+diff --git a/runtime/nvn_api_core.c b/runtime/nvn_api_core.c
+index ae1b8c8558e5742eaa8d929de2bb40308525cfe3..9142d06ca9037d3e71f76370c20c1a2f80140a6e 100644
+--- a/runtime/nvn_api_core.c
++++ b/runtime/nvn_api_core.c
+@@ -479,23 +479,24 @@ NVN_API(nvnSyncFinalize) { ((sync_t *)arg_p(c, 0))->magic = 0; }
+ // the queue so far has completed"
+ NVN_API(nvnQueueFenceSync) {
+     sync_t *s = arg_p(c, 1);
+-    s->fenced = 1;
+-    s->fence = nvn_fence_last();
++    __atomic_store_n(&s->fence, nvn_fence_last(), __ATOMIC_RELAXED);
++    __atomic_store_n(&s->fenced, 1, __ATOMIC_RELEASE);
+ }
+ // NVNsyncWaitResult nvnSyncWait(const NVNsync *s, uint64_t timeout_ns): a sync never fenced reports a timeout at once;
+ // a fenced one is released only after the back end completed that fence value
+ NVN_API(nvnSyncWait) {
+     const sync_t *s = arg_p(c, 0);
+     uint64_t timeout = arg_x(c, 1);
+-    if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
++    if (!__atomic_load_n(&s->fenced, __ATOMIC_ACQUIRE)) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
++    uint64_t fence = __atomic_load_n(&s->fence, __ATOMIC_RELAXED);
+     const GfxBackend *b = gfx_backend();
+-    if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
++    if (b->fence_done() >= fence) { b->cpu_synced(fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+     int ok;
+     {
+         NVN_BLOCKING();
+-        ok = b->fence_wait(s->fence, timeout);
++        ok = b->fence_wait(fence, timeout);
+     }
+-    if (ok) b->cpu_synced(s->fence);
++    if (ok) b->cpu_synced(fence);
+     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+ }
+ // LOCAL TEST (Ocarina): void nvnQueueWaitSync(NVNqueue *q, const NVNsync *s): later work on q runs after the fence. Submits
+@@ -504,13 +505,14 @@ NVN_API(nvnSyncWait) {
+ NVN_API(nvnQueueWaitSync) {
+     const sync_t *s = arg_p(c, 1);
+     static volatile int64_t timeouts;
+-    if (!s || !s->fenced) return;
++    if (!s || !__atomic_load_n(&s->fenced, __ATOMIC_ACQUIRE)) return;
++    uint64_t fence = __atomic_load_n(&s->fence, __ATOMIC_RELAXED);
+     const GfxBackend *b = gfx_backend();
+-    if (b->fence_done() >= s->fence) return;
++    if (b->fence_done() >= fence) return;
+     int ok;
+     {
+         NVN_BLOCKING();
+-        ok = b->fence_wait(s->fence, 200000000);
++        ok = b->fence_wait(fence, 200000000);
+     }
+     if (!ok && __atomic_add_fetch(&timeouts, 1, __ATOMIC_RELAXED) == 1) rt_log("nvn: LOCAL TEST: nvnQueueWaitSync timed out");
+ }
+@@ -633,11 +635,13 @@ NVN_API(nvnQueueSubmitCommands) {
+         plat_mutex_lock(&submit_lock);
+         nvn_submit_prepare_async(h, hs, n);
+         f = gfx_backend()->submit(hs, n, submitted);
++        nvn_submit_publish_fences(h, n, f);
+         plat_mutex_unlock(&submit_lock);
+         if (hs != local) free(hs);
+     } else {
+         nvn_submit_prepare(h, n);
+         f = gfx_backend()->submit(h, n, submitted);
++        nvn_submit_publish_fences(h, n, f);
+     }
+     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
+     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
+@@ -648,6 +652,7 @@ NVN_API(nvnQueueSubmitCommands) {
+         if (on < 0) { const char *e = getenv("OOT_SUBMIT_SYNC"); on = !(e && *e == '0'); }   // on by default: the game rewrites data the replay has not reached yet (random NaN frames otherwise)
+         if (on) gfx_backend()->fence_wait(f, 400000000);
+     }
++    if (rt_config()->probe_nvn_boot) rt_boot_nvn_submit(n, f);
+ }
+ 
+ // The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
+diff --git a/runtime/nvn_api_obj.c b/runtime/nvn_api_obj.c
+index d688fd56425a77b3f8ec2f010ef08895cd4e310e..330563d208fad88a3e5d676dfd8fe7f42f9814e8 100644
+--- a/runtime/nvn_api_obj.c
++++ b/runtime/nvn_api_obj.c
+@@ -771,8 +771,8 @@ NVN_API(nvnWindowAcquireTexture) {
+     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
+     // already satisfied: fenced = 3 with fence 0.
+     if (s) {
+-        s->fenced = 3;
+-        s->fence = 0;
++        __atomic_store_n(&s->fence, 0, __ATOMIC_RELAXED);
++        __atomic_store_n(&s->fenced, 3, __ATOMIC_RELEASE);
+     }
+     ret_x(c, NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
+ }
+diff --git a/runtime/nvn_ext.c b/runtime/nvn_ext.c
+index dfa603485e7119aeadfd6a23248eeef97fa56bff..a3f371eddb2f3600da4ac69379cfbca14c031563 100644
+--- a/runtime/nvn_ext.c
++++ b/runtime/nvn_ext.c
+@@ -119,9 +119,17 @@ NVN_API(nvnTextureBuilderGetViewOffset) {
+     if (w->set_layers) off += (uint64_t)w->min_layer * L.layer_size;
+     ret_x(c, off);
+ }
+-// size_t nvnTextureBuilderGetZCullStorageSize / nvnTextureGetZCullStorageSize: the depth-cull cache needs no storage
+-NVN_API(nvnTextureBuilderGetZCullStorageSize) { ret_x(c, 0); }
+-NVN_API(nvnTextureGetZCullStorageSize) { ret_x(c, 0); }
++// Star Fox allocates a ZCull buffer even on a backend without a depth-cull cache. Reserve
++// aligned placeholder storage scaled to the target; Save/RestoreZCullData leave it alone.
++static uint64_t zcull_storage_size(const nvn_texdesc *d) {
++    if (rt_game_version) return 0;
++    uint64_t columns = ((uint64_t)d->width + 31) / 32;
++    uint64_t rows = ((uint64_t)d->height + 31) / 32;
++    uint64_t bytes = columns * rows * (d->depth ? d->depth : 1) * 8;
++    return bytes ? (bytes + 255) & ~255ull : 256;
++}
++NVN_API(nvnTextureBuilderGetZCullStorageSize) { ret_x(c, zcull_storage_size(&tb_of(c)->d)); }
++NVN_API(nvnTextureGetZCullStorageSize) { ret_x(c, zcull_storage_size(&tex_of(c)->d)); }
+ 
+ // ---------- window queries
+ static const win_builder_t *wb_of(const Cpu *c) { return arg_p(c, 0); }
+diff --git a/runtime/nvn_obj.h b/runtime/nvn_obj.h
+index 95118d2c4b5a019013e845318eddc28516796af0..7d0261eb9fb00edffb3867ae6789e010828faab5 100644
+--- a/runtime/nvn_obj.h
++++ b/runtime/nvn_obj.h
+@@ -147,7 +147,7 @@ enum {
+     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
+     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
+     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
+-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_PRIM_RESTART, OP_DRAW_IDX_IND, OP_DISPATCH_IND, OP_CLEAR_BUF, OP_PUSH_CONST, OP_WAIT_SYNC, OP_DRAW_MESH_IND, OP_DRAW_MESH, OP_COUNT_
++    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_PRIM_RESTART, OP_DRAW_IDX_IND, OP_DISPATCH_IND, OP_CLEAR_BUF, OP_PUSH_CONST, OP_WAIT_SYNC, OP_DRAW_MESH_IND, OP_DRAW_MESH, OP_FENCE_SYNC, OP_COUNT_
+ };
+ // Payload (immediately follows op_hdr)
+ typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
+diff --git a/runtime/nvn_probe.c b/runtime/nvn_probe.c
+index 88df7289f0c841b529bd99fb145a15e2a6132db2..471acecf3d775b0ca30b6cd0aada62603c0119a7 100644
+--- a/runtime/nvn_probe.c
++++ b/runtime/nvn_probe.c
+@@ -7,8 +7,8 @@
+ //     CallCommands inlining a recording;
+ //   - the null back end's CPU-visible side effects (event write and add, counter report, buffer copy, uniform update,
+ //     in stream order across handles) landing in guest memory at submit, and not before;
+-//   - the proc table: every name of nvn_procs.inc resolves to its own synthetic address, an unknown name to NULL;
+-//   - named fatal stubs stop with their name, each in a child process (this executable again, TOTK_PROBE_NVN_CHILD).
++//   - the proc table: every name of nvn_procs.inc resolves to its own synthetic address, an unknown name to the diagnostic stub;
++//   - named compatibility stubs log their name and return zero in a child process (TOTK_PROBE_NVN_CHILD).
+ // The 40 layout goldens themselves are run by --probe-nvn-tex against nvn_tex.c; here four of them go through the procs.
+ // Ported in part from MacNativeGames games/totk/tests/texture_auto_layout/probe.c @ b75be8cf (MIT, Copyright (c) 2026
+ // jhaizhou; origin d2r-mobile): the golden metadata, which holds no game bytes.
+@@ -38,10 +38,8 @@ static const ProcRow procs[] = {
+ };
+ #define NPROCS ((int)(sizeof procs / sizeof *procs))
+ 
+-// The named fatal stubs checked in child processes: proc names that no task implements (NvRm interop of the NVX
+-// extension), so the check does not go stale when the stub list shrinks.
+-static const char *const fatal_procs[] = {"nvnSyncGetNvRmSyncNVX", "nvnTextureGetNvRmSurfaceNVX"};
+-#define NFATAL ((int)(sizeof fatal_procs / sizeof *fatal_procs))
++static const char *const stub_procs[] = {"nvnSyncGetNvRmSyncNVX", "nvnTextureGetNvRmSurfaceNVX"};
++#define NSTUBS ((int)(sizeof stub_procs / sizeof *stub_procs))
+ 
+ static int failures, checks, n_objects, n_ops, n_effects;
+ #define CHECK(cond, ...) \
+@@ -462,6 +460,9 @@ static uint64_t record_all(void) {
+     static const uint32_t pushed[4] = {0x39b60b61, 0x3a21d13a, 0x45340000, 0x44ca8000};   // 1/2880, 1/1620, 2880, 1620
+     REC(OP_PUSH_CONST, CALL(nvnCommandBufferPushGraphicsConstants, U(c), 0, 0x10, sizeof pushed, U(pushed)));
+     REC(OP_WAIT_SYNC, CALL(nvnCommandBufferWaitSync, U(c), U(&syncs)));
++    REC(OP_FENCE_SYNC, CALL(nvnCommandBufferFenceSync, U(c), U(&syncs), NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0));
++    REC(OP_DRAW_MESH, CALL(nvnCommandBufferDrawMeshTasks, U(c), 2, 3));
++    REC(OP_DRAW_MESH_IND, CALL(nvnCommandBufferDrawMeshTasksIndirect, U(c), 0xc400));
+     CALL(nvnCommandBufferPushComputeConstants, U(c), 0, 0, 2, U(pushed));   // under 4 bytes: dropped, as the driver does
+     static const int thresholds[4] = {1, 2, 3, 4};
+     CALL(nvnCommandBufferSetColorReductionEnable, U(c), 1);   // hints: nothing recorded
+@@ -701,6 +702,14 @@ static void parse_all(uint64_t h) {
+         }
+         case OP_WAIT_SYNC: CHECK(((const p_wait_sync *)a)->sync == (const sync_t *)(const void *)&syncs,
+                                  "WAIT_SYNC retains the submit-time source pointer"); break;
++        case OP_FENCE_SYNC: CHECK(((const p_fence_sync *)a)->sync == (sync_t *)(void *)&syncs,
++                                  "FENCE_SYNC retains the submit-time destination pointer"); break;
++        case OP_DRAW_MESH: {
++            const p_draw_mesh *p = a;
++            CHECK(p->first == 2 && p->count == 3, "DRAW_MESH payload");
++            break;
++        }
++        case OP_DRAW_MESH_IND: CHECK(((const p_draw_mesh_ind *)a)->ind == 0xc400, "DRAW_MESH_IND payload"); break;
+         default: CHECK(0, "unexpected op %s", nvn_op_name(o->op)); break;
+         }
+     }
+@@ -780,6 +789,7 @@ static void probe_null_effects(void) {
+     begin(&cmd2, ctlmem2, 0x38000);
+     CALL(nvnCommandBufferUpdateUniformBuffer, U(&cmd2), base + OFF_DST, 64, 0, 8, U(d2));   // after the first copy
+     CALL(nvnCommandBufferSignalEvent, U(&cmd2), U(&ev), NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_TOP, 0, 0x99);
++    CALL(nvnCommandBufferFenceSync, U(&cmd2), U(&syncs), NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+     uint64_t hb = CALL(nvnCommandBufferEndRecording, U(&cmd2));
+ 
+     CHECK(*(uint32_t *)ev_val == 0 && !pmem[OFF_UB + 4] && !pmem[OFF_DST] && pmem[OFF_COUNTER_B] == 0xaa,
+@@ -789,6 +799,8 @@ static void probe_null_effects(void) {
+     uint64_t hs[2] = {ha, hb};
+     CALL(nvnQueueSubmitCommands, U(&queue), 2, U(hs));
+     uint64_t t1 = rt_ticks();
++    CHECK(((const sync_t *)(const void *)&syncs)->fence == fence0 + 1 &&
++          CALL(nvnSyncWait, U(&syncs), 0) == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED, "recorded fence names the completed submit");
+     CALL(nvnQueueFenceSync, U(&queue), U(&syncs), NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
+     uint64_t wait = CALL(nvnSyncWait, U(&syncs), 1000000000ull);
+     CHECK(wait == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || wait == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED, "SyncWait after the submit: %llu",
+@@ -847,14 +859,16 @@ static void probe_proc_table(void) {
+         for (int k = i + 1; k < NPROCS; k++) dup += addr[i] && addr[i] == addr[k];
+     CHECK(dup == 0, "%d procs share a synthetic address", dup);
+     CHECK(NPROCS >= 534, "the proc list has %d names, the loader asks for 534", NPROCS);
+-    CHECK(nvn_proc_address("nvnNoSuchProc") == 0 && nvn_proc_address("") == 0 && nvn_proc_address(NULL) == 0,
+-          "an unknown name returns NULL");
++    uint64_t missing = nvn_proc_address("nvnNoSuchProc");
++    const char *missing_name = missing ? hostfn_name(missing) : NULL;
++    CHECK(missing_name && !strcmp(missing_name, "nvn:missing") && !nvn_proc_address("") && !nvn_proc_address(NULL),
++          "an unknown name uses the diagnostic stub, empty and null names return NULL");
+     // nvnDeviceGetProcAddress(device, name), the way the loader calls it
+     CHECK(CALL(nvnDeviceGetProcAddress, U(&dev), U("nvnBufferGetSize")) == nvn_proc_address("nvnBufferGetSize") &&
+-              CALL(nvnDeviceGetProcAddress, U(&dev), U("nvnNoSuchProc")) == 0, "nvnDeviceGetProcAddress");
++              CALL(nvnDeviceGetProcAddress, U(&dev), U("nvnNoSuchProc")) == missing, "nvnDeviceGetProcAddress");
+ }
+ 
+-// ---- named fatal stubs, each in a child process
++// ---- named compatibility stubs, each in a child process
+ static uint32_t run_child(const char *mode, char *out, size_t cap) {
+     int code = plat_run_self(CHILD_ENV, mode, out, cap, 0);
+     if (code < 0) rt_fatal("probe-nvn: cannot start the %s child", mode);
+@@ -864,23 +878,20 @@ static uint32_t run_child(const char *mode, char *out, size_t cap) {
+ static int run_as_child(const char *name) {
+     for (int i = 0; i < NPROCS; i++)
+         if (!strcmp(procs[i].name, name)) {
++            cpu.x[0] = UINT64_MAX;
+             procs[i].fn(&cpu);
+-            printf("child %s: the call returned\n", name);
+-            return 0;
++            return cpu.x[0] != 0;
+         }
+     rt_fatal("probe-nvn: no proc %s", name);
+ }
+ 
+ static void probe_children(void) {
+     static char out[16384];
+-    for (int i = 0; i < NFATAL; i++) {
+-        uint32_t code = run_child(fatal_procs[i], out, sizeof out);
++    for (int i = 0; i < NSTUBS; i++) {
++        uint32_t code = run_child(stub_procs[i], out, sizeof out);
+         char want[160];
+-        snprintf(want, sizeof want, "NVN %s is not implemented", fatal_procs[i]);
+-        CHECK(code == 70 && strstr(out, "FATAL: ") && strstr(out, want), "child %s: exit %u, output: %s", fatal_procs[i], code, out);
+-        const char *line = strstr(out, "FATAL: ");
+-        int len = line ? (int)strcspn(line, "\r\n") : 0;
+-        printf("fatal stub %-30s child exit %u: %.*s\n", fatal_procs[i], code, len, line ? line : "(no FATAL line)");
++        snprintf(want, sizeof want, "%s is not implemented, returning 0", stub_procs[i]);
++        CHECK(code == 0 && strstr(out, want), "child %s: exit %u, output: %s", stub_procs[i], code, out);
+     }
+ }
+ 
+@@ -899,6 +910,6 @@ int probe_nvn(void) {
+         return 1;
+     }
+     printf("probe-nvn: passed (%d checks: %d object cases, %d op kinds recorded and parsed, %d procs resolved, %d side effects on the %s "
+-           "back end, %d fatal stubs in child processes)\n", checks, n_objects, n_ops, NPROCS, n_effects, gfx_backend()->name, NFATAL);
++           "back end, %d compatibility stubs in child processes)\n", checks, n_objects, n_ops, NPROCS, n_effects, gfx_backend()->name, NSTUBS);
+     return 0;
+ }
+diff --git a/runtime/nvn_procs.c b/runtime/nvn_procs.c
+index 8c4a10cbf08e898e951ccbc1669f3221ccc62f98..f7b347c7709af82acbce7cf9655f85ff5654a450 100644
+--- a/runtime/nvn_procs.c
++++ b/runtime/nvn_procs.c
+@@ -46,13 +46,15 @@ static uint64_t missing_proc_addr;
+ static void nvnp_missing_proc(Cpu *c) {
+     static uint64_t seen[64];
+     static int n;
++    static PlatMutex lock = PLAT_MUTEX_INIT;
+     uint64_t lr = c->x[30];
++    plat_mutex_lock(&lock);
+     int known = 0;
+     for (int i = 0; i < n; i++) known |= seen[i] == lr;
+-    if (!known && n < 64) {
+-        seen[n++] = lr;
+-        rt_log("nvn: LOCAL TEST: missing proc called from %#llx", (unsigned long long)lr);
+-    }
++    int fresh = !known && n < 64;
++    if (fresh) seen[n++] = lr;
++    plat_mutex_unlock(&lock);
++    if (fresh) rt_log("nvn: missing proc called from %#llx", (unsigned long long)lr);
+     ret_x(c, 0);
+ }
+ 
+@@ -66,10 +68,11 @@ void nvn_procs_register(void) {
+ }
+ 
+ uint64_t nvn_proc_address(const char *name) {
+-    if (!name) return 0;
++    if (!name || !*name) return 0;
+     const Proc *p = bsearch(&(Proc){name, 0}, procs, (size_t)nprocs, sizeof *procs, by_name);
++    if (rt_trace & RT_TRACE_GFX) rt_log("nvn: proc %s (%s)", name, p ? "registered" : "missing");
+     if (p) return p->addr;
+-    // Unknown names get NULL, as on hardware; each distinct one is logged once.
++    // Games using a newer table get a diagnostic stub for unregistered names.
+     static PlatMutex lock = PLAT_MUTEX_INIT;
+     static char seen[32][96];
+     static int nseen;
+diff --git a/runtime/ov_gfx.c b/runtime/ov_gfx.c
+index cbd8546ff1a503b648fe6aeedd68e2bbdc490b2b..2b3e49bba449ea36c00119dc4225dfc174d80c0b 100644
+--- a/runtime/ov_gfx.c
++++ b/runtime/ov_gfx.c
+@@ -97,6 +97,14 @@ static void ov_native_window(Cpu *c) {
+     ret_x(c, 0);
+ }
+ 
++// Result nn::vi::GetLatestFrameNumber(uint64_t *out, const Layer *layer)
++static void ov_latest_frame(Cpu *c) {
++    uint64_t *out = arg_p(c, 0);
++    if (!out || !vi_up() || arg_p(c, 1) != layer) { ret_x(c, VI_R_INVALID); return; }
++    *out = gfx_stats().frames;
++    ret_x(c, 0);
++}
++
+ // Result nn::vi::GetDisplayVsyncEvent(os::SystemEventType *event, Display *display): auto-clear system event
+ static void ov_vsync_event(Cpu *c) {
+     uint64_t ev = arg_x(c, 0);
+@@ -160,5 +168,6 @@ HOST_OVERRIDE("_ZN2nn2vi10InitializeEv", ov_vi_initialize);
+ HOST_OVERRIDE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", ov_open_display);
+ HOST_OVERRIDE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", ov_create_layer);
+ HOST_OVERRIDE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", ov_native_window);
++HOST_OVERRIDE("_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE", ov_latest_frame);
+ HOST_OVERRIDE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", ov_vsync_event);
+ HOST_OVERRIDE("nvnBootstrapLoader", ov_nvn_bootstrap);
+diff --git a/runtime/ov_input.c b/runtime/ov_input.c
+index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497fe3adf1c 100644
+--- a/runtime/ov_input.c
++++ b/runtime/ov_input.c
+@@ -69,6 +69,13 @@ static void ov_supported_styles(Cpu *c) {
+     plat_mutex_unlock(&lock);
+ }
+ 
++static void ov_get_supported_styles(Cpu *c) {
++    plat_mutex_lock_shared(&lock);
++    uint32_t v = styles;
++    plat_mutex_unlock_shared(&lock);
++    ret_x(c, v);
++}
++
+ // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
+ static void ov_style_set(Cpu *c) {
+     uint32_t id = *need_id(c, 0, "GetNpadStyleSet");
+@@ -78,14 +85,9 @@ static void ov_style_set(Cpu *c) {
+     ret_x(c, v);
+ }
+ 
+-// int GetNpadStates(<State> *out, int count, const NpadIdType &id): the newest state only. want: the style of the
+-// overload, 0 for the Joy-Con overloads (never connected).
+-static void npad_states(Cpu *c, uint32_t want) {
+-    NpadState *out = arg_p(c, 0);
+-    int max = (int)arg_x(c, 1);
+-    uint32_t id = *need_id(c, 2, "GetNpadStates");
+-    if (max <= 0) { ret_x(c, 0); return; }
+-    if (!out) rt_fatal("nn::hid::GetNpadStates: null output");
++// want is the style of the overload, or zero for disconnected Joy-Con.
++static void npad_fill(NpadState *out, uint32_t id, uint32_t want) {
++    if (!out) rt_fatal("nn::hid: null Npad state output");
+     plat_mutex_lock(&lock);
+     NpadState s = {.sampling = ++sample};
+     int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
+@@ -95,11 +97,26 @@ static void npad_states(Cpu *c, uint32_t want) {
+         input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
+     }
+     *out = s;
++}
++
++// int GetNpadStates(<State> *out, int count, const NpadIdType &id): the newest state only.
++static void npad_states(Cpu *c, uint32_t want) {
++    uint32_t id = *need_id(c, 2, "GetNpadStates");
++    if ((int)arg_x(c, 1) <= 0) { ret_x(c, 0); return; }
++    npad_fill(arg_p(c, 0), id, want);
+     ret_x(c, 1);
+ }
+ static void ov_states_full_key(Cpu *c) { npad_states(c, STYLE_FULL_KEY); }
+ static void ov_states_handheld(Cpu *c) { npad_states(c, STYLE_HANDHELD); }
+ static void ov_states_joycon(Cpu *c) { npad_states(c, 0); }
++static void ov_state_full_key(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), STYLE_FULL_KEY); }
++static void ov_state_handheld(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), STYLE_HANDHELD); }
++static void ov_state_joycon(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), 0); }
++
++// StreamPlay keeps the requested feature mask even when there are no remote controllers.
++static volatile int32_t streamplay_features;
++static void ov_streamplay_get_features(Cpu *c) { ret_x(c, (uint32_t)plat_cas32(&streamplay_features, 0, 0)); }
++static void ov_streamplay_set_features(Cpu *c) { plat_xchg32(&streamplay_features, (int32_t)arg_x(c, 0)); }
+ 
+ // void SetNpadJoyHoldType(NpadJoyHoldType type)
+ static void ov_hold_type(Cpu *c) {
+@@ -490,15 +507,21 @@ static void ov_touch_init(Cpu *c) {
+     once(&logged, "hid: the game initialized the touch screen (none on this host)", 0);
+ }
+ 
+-// void GetTouchScreenState<1>(TouchScreenState<1> *out): sampling number, then a count of 0 touches
+-static void ov_touch_state1(Cpu *c) {
++// One state with the current sampling number and no touches.
++static void touch_state(Cpu *c, unsigned points) {
+     static volatile int64_t sampling;
+     uint8_t *out = arg_p(c, 0);
+     if (!out) rt_fatal("nn::hid::GetTouchScreenState: null output");
+-    memset(out, 0, 0x38);   // int64 sampling number, int32 count, int32 reserved, one 0x28-byte TouchState
++    memset(out, 0, 0x10 + points * 0x28);
+     int64_t n = __atomic_add_fetch(&sampling, 1, __ATOMIC_RELAXED);
+     memcpy(out, &n, 8);
+ }
++static void ov_touch_state1(Cpu *c) { touch_state(c, 1); }
++static void ov_touch_states5(Cpu *c) {
++    int count = (int)arg_x(c, 1) > 0;
++    if (count) touch_state(c, 5);
++    ret_x(c, count);
++}
+ 
+ // void SetNpadJoyAssignmentModeDual(const NpadIdType &), SetNpadJoyAssignmentModeSingle(const NpadIdType &,
+ // NpadJoyDeviceType), Result MergeSingleJoyAsDualJoy(const NpadIdType &, const NpadIdType &): the host's one pad is
+@@ -512,20 +535,45 @@ HOST_OVERRIDE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS
+ HOST_OVERRIDE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", ov_vib_init);
+ HOST_OVERRIDE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", ov_vib_info);
+ HOST_OVERRIDE("_ZN2nn3hid21InitializeTouchScreenEv", ov_touch_init);
++
++// Joy-Con 2 mouse sensor: the host has no JCMS device, so its ring contains no samples.
++static void ov_jcms_idle(Cpu *c) { (void)c; }
++static void ov_jcms_states(Cpu *c) { ret_x(c, 0); }
++static void ov_jcms_handle(Cpu *c) {
++    const uint32_t *id = need_id(c, 0, "GetJcmsHandle");
++    const uint32_t *type = need_id(c, 1, "GetJcmsHandle");
++    ret_x(c, (*id & 0xff) | (*type & 0xff) << 8);
++}
++HOST_OVERRIDE("_ZN2nn3hid14InitializeJcmsEPvm", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid12FinalizeJcmsEv", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid13GetJcmsStatesEPNS0_9JcmsStateEiRKNS0_10JcmsHandleE", ov_jcms_states);
++HOST_OVERRIDE("_ZN2nn3hid13GetJcmsHandleERKjRKNS0_8JcmsTypeE", ov_jcms_handle);
+ HOST_OVERRIDE("_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE", ov_touch_state1);
++HOST_OVERRIDE("_ZN2nn3hid20GetTouchScreenStatesILm5EEEiPNS0_16TouchScreenStateIXT_EEEi", ov_touch_states5);
+ HOST_OVERRIDE("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", ov_joy_assignment);
++HOST_OVERRIDE("_ZN2nn3hid20GetNpadJoyAssignmentERKj", ov_joy_assignment);
+ HOST_OVERRIDE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", ov_joy_assignment);
+ HOST_OVERRIDE("_ZN2nn3hid23MergeSingleJoyAsDualJoyERKjS2_", ov_joy_assignment);
+ 
+ HOST_OVERRIDE("_ZN2nn3hid14InitializeNpadEv", ov_initialize_npad);
+ HOST_OVERRIDE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", ov_supported_ids);
+ HOST_OVERRIDE("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", ov_supported_styles);
++HOST_OVERRIDE("_ZN2nn3hid24GetSupportedNpadStyleSetEv", ov_get_supported_styles);
+ HOST_OVERRIDE("_ZN2nn3hid15GetNpadStyleSetERKj", ov_style_set);
+ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", ov_states_full_key);
+ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", ov_states_joycon);
+ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", ov_states_joycon);
+ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", ov_states_joycon);
+ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", ov_states_handheld);
++HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", ov_state_full_key);
++HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", ov_state_handheld);
++HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", ov_state_joycon);
++HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", ov_state_joycon);
++HOST_OVERRIDE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", ov_state_joycon);
++HOST_OVERRIDE("_ZN2nn10streamplay25GetSupportedHidFeatureSetEv", ov_streamplay_get_features);
++HOST_OVERRIDE("_ZN2nn10streamplay25SetSupportedHidFeatureSetENS_4util10BitFlagSetILi32ENS0_13HidFeatureTagEEE", ov_streamplay_set_features);
+ HOST_OVERRIDE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", ov_hold_type);
+ HOST_OVERRIDE("_ZN2nn3hid14DisconnectNpadERKj", ov_disconnect);
+ HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
+diff --git a/runtime/ov_media.c b/runtime/ov_media.c
+index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297db693f8a7 100644
+--- a/runtime/ov_media.c
++++ b/runtime/ov_media.c
+@@ -5,6 +5,7 @@
+ #include <stdint.h>
+ #include <limits.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include <opus/opus.h>
+ 
+@@ -13,6 +14,23 @@
+ 
+ #define CODEC_R_INVALID 0x1fcd1u   // MacNativeGames' "invalid argument" result for nn::codec
+ #define OPUS_WORK_SIZE 0x9000u     // what the game is told to reserve: libopus stereo decoder state (about 26 KiB) plus 4 KiB
++#define OPUS_MANAGER_WORK_SIZE 0x1000u
++#define OPUS_PACKET_LIMIT 0x1800u
++#define OPUS_PCM_SAMPLES (5760 * 2)  // up to 120 ms at 48 kHz, stereo
++#define OPUS_R_NO_BUFFER 0x3a6fu
++
++typedef struct OpusManager {
++    uint64_t guest, event;
++    int slots, used;
++    struct OpusManager *next;
++} OpusManager;
++
++typedef struct OpusRequest {
++    struct OpusRequest *next;
++    int packet_size, samples;
++    uint8_t packet[OPUS_PACKET_LIMIT];
++    int16_t pcm[OPUS_PCM_SAMPLES];
++} OpusRequest;
+ 
+ // One record per initialised decoder object (the guest's HardwareOpusDecoderType). The registry lock only guards the
+ // list; a decoder's own lock serialises its libopus state, so different streams decode in parallel. Lock order:
+@@ -22,10 +40,14 @@ typedef struct Decoder {
+     uint64_t guest;
+     OpusDecoder *dec;
+     int rate, channels;
++    OpusManager *manager;
++    OpusRequest *head, *tail;
++    int waiting, completed;
+     PlatMutex use;
+     struct Decoder *next;
+ } Decoder;
+ static Decoder *decoders;
++static OpusManager *managers;
+ static PlatMutex lock = PLAT_MUTEX_INIT;
+ 
+ static int valid_format(int rate, int channels) {
+@@ -33,11 +55,16 @@ static int valid_format(int rate, int channels) {
+            (channels == 1 || channels == 2);
+ }
+ 
++static Decoder *decoder_find(uint64_t guest) { // under lock
++    Decoder *d = decoders;
++    while (d && d->guest != guest) d = d->next;
++    return d;
++}
++
+ // Returns the decoder with its use lock held.
+ static Decoder *acquire(uint64_t guest, const char *fn) {
+     plat_mutex_lock_shared(&lock);
+-    Decoder *d = decoders;
+-    while (d && d->guest != guest) d = d->next;
++    Decoder *d = decoder_find(guest);
+     if (d) plat_mutex_lock(&d->use);
+     plat_mutex_unlock_shared(&lock);
+     if (!d) rt_fatal("nn::codec::%s: unknown hardware Opus decoder %#llx", fn, (unsigned long long)guest);
+@@ -46,6 +73,23 @@ static Decoder *acquire(uint64_t guest, const char *fn) {
+ 
+ static void release(Decoder *d) { plat_mutex_unlock(&d->use); }
+ 
++static OpusManager *manager_find(uint64_t guest) { // under lock
++    OpusManager *m = managers;
++    while (m && m->guest != guest) m = m->next;
++    return m;
++}
++
++static void clear_requests(Decoder *d) { // under exclusive lock
++    if (d->manager) d->manager->used -= d->waiting + d->completed;
++    while (d->head) {
++        OpusRequest *r = d->head;
++        d->head = r->next;
++        free(r);
++    }
++    d->tail = NULL;
++    d->waiting = d->completed = 0;
++}
++
+ static OpusDecoder *opus_new(int rate, int channels) {
+     int err = 0;
+     OpusDecoder *o = opus_decoder_create(rate, channels, &err);
+@@ -67,10 +111,11 @@ static void ov_initialize(Cpu *c) {
+     if (!guest || !valid_format(rate, channels) || size < OPUS_WORK_SIZE) { ret_x(c, CODEC_R_INVALID); return; }
+     OpusDecoder *fresh = opus_new(rate, channels);
+     plat_mutex_lock(&lock);
+-    Decoder *d = decoders;
+-    while (d && d->guest != guest) d = d->next;
++    Decoder *d = decoder_find(guest);
+     if (d) {
+         plat_mutex_lock(&d->use);   // waits for a decode in flight
++        clear_requests(d);
++        d->manager = NULL;
+         OpusDecoder *old = d->dec;
+         d->dec = fresh;
+         d->rate = rate;
+@@ -102,9 +147,11 @@ static void ov_finalize(Cpu *c) {
+     if (!*p) rt_fatal("nn::codec::FinalizeHardwareOpusDecoder: unknown decoder %#llx", (unsigned long long)guest);
+     Decoder *d = *p;
+     plat_mutex_lock(&d->use);   // a decode in flight finishes first; the registry lock keeps new ones out
++    clear_requests(d);
+     *p = d->next;
+     plat_mutex_unlock(&lock);
+     opus_decoder_destroy(d->dec);
++    plat_mutex_unlock(&d->use);
+     free(d);
+ }
+ 
+@@ -125,14 +172,195 @@ static void ov_channel_count(Cpu *c) {
+ 
+ // Result ResetHardwareOpusDecoder(HardwareOpusDecoderType *d)
+ static void ov_reset(Cpu *c) {
+-    Decoder *d = acquire(arg_x(c, 0), "ResetHardwareOpusDecoder");
++    plat_mutex_lock(&lock);
++    Decoder *d = decoder_find(arg_x(c, 0));
++    if (!d) rt_fatal("nn::codec::ResetHardwareOpusDecoder: unknown decoder");
++    plat_mutex_lock(&d->use);
++    clear_requests(d);
+     int ok = opus_decoder_ctl(d->dec, OPUS_RESET_STATE);
+     release(d);
++    plat_mutex_unlock(&lock);
+     ret_x(c, ok == OPUS_OK ? 0 : CODEC_R_INVALID);
+ }
+ 
+ static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+ 
++// SDK 21 submits asynchronous Opus packets to a manager. Execute decodes the waiting packets
++// on the calling thread with libopus. Each request holds one I/O slot until dequeue or reset.
++static void ov_manager_work_size(Cpu *c) {
++    int count = (int)arg_x(c, 3), slots = (int)arg_x(c, 4);
++    ret_x(c, count > 0 && slots > 0 && valid_format((int)arg_x(c, 0), (int)arg_x(c, 1)) ? OPUS_MANAGER_WORK_SIZE : 0);
++}
++
++static void ov_manager_initialize(Cpu *c) {
++    uint64_t guest = arg_x(c, 0), event = arg_x(c, 1);
++    int rate = (int)arg_x(c, 2), channels = (int)arg_x(c, 3);
++    int count = (int)arg_x(c, 5), slots = (int)arg_x(c, 6);
++    if (!guest || !event || !valid_format(rate, channels) || count <= 0 || slots <= 0 ||
++        !arg_x(c, 7) || LD64(c->sp) < OPUS_MANAGER_WORK_SIZE) { ret_x(c, CODEC_R_INVALID); return; }
++    plat_mutex_lock(&lock);
++    if (manager_find(guest)) {
++        plat_mutex_unlock(&lock);
++        ret_x(c, CODEC_R_INVALID);
++        return;
++    }
++    OpusManager *m = calloc(1, sizeof *m);
++    if (!m) rt_fatal("nn::codec: Opus manager allocation");
++    kern_bind_system_event(c, event, 1);
++    *m = (OpusManager){.guest = guest, .event = event, .slots = slots, .next = managers};
++    managers = m;
++    ST64(guest, guest);  // the SDK client checks this word for an initialized manager
++    plat_mutex_unlock(&lock);
++    ret_x(c, 0);
++}
++
++static void ov_manager_finalize(Cpu *c) {
++    uint64_t guest = arg_x(c, 0);
++    plat_mutex_lock(&lock);
++    OpusManager **link = &managers;
++    while (*link && (*link)->guest != guest) link = &(*link)->next;
++    OpusManager *m = *link;
++    if (m) {
++        for (Decoder *d = decoders; d; d = d->next) {
++            if (d->manager != m) continue;
++            clear_requests(d);
++            d->manager = NULL;
++        }
++        *link = m->next;
++        ST64(guest, 0);
++        kern_forget_system_event(m->event);
++        free(m);
++    }
++    plat_mutex_unlock(&lock);
++}
++
++static void ov_manager_slots(Cpu *c) {
++    plat_mutex_lock_shared(&lock);
++    OpusManager *m = manager_find(arg_x(c, 0));
++    int free_slots = m ? m->slots - m->used : 0;
++    plat_mutex_unlock_shared(&lock);
++    ret_x(c, free_slots);
++}
++
++static void ov_managed_initialize(Cpu *c) {
++    uint64_t guest = arg_x(c, 0);
++    int rate = (int)arg_x(c, 1), channels = (int)arg_x(c, 2);
++    if (!guest || !valid_format(rate, channels)) { ret_x(c, CODEC_R_INVALID); return; }
++    plat_mutex_lock(&lock);
++    OpusManager *m = manager_find(arg_x(c, 4));
++    Decoder *d = decoder_find(guest);
++    if (!m || d) {
++        plat_mutex_unlock(&lock);
++        ret_x(c, CODEC_R_INVALID);
++        return;
++    }
++    d = calloc(1, sizeof *d);
++    if (!d) rt_fatal("nn::codec: managed decoder allocation");
++    d->dec = opus_new(rate, channels);
++    plat_mutex_init(&d->use);
++    d->guest = guest;
++    d->rate = rate;
++    d->channels = channels;
++    d->manager = m;
++    d->next = decoders;
++    decoders = d;
++    plat_mutex_unlock(&lock);
++    ret_x(c, 0);
++}
++
++static void ov_opus_enqueue(Cpu *c) {
++    size_t *consumed = arg_p(c, 1), size = arg_x(c, 3);
++    const uint8_t *in = arg_p(c, 2);
++    if (consumed) *consumed = 0;
++    if (!in || size < 8 || size > OPUS_PACKET_LIMIT + 8 || be32(in) != size - 8) {
++        ret_x(c, CODEC_R_INVALID);
++        return;
++    }
++    plat_mutex_lock(&lock);
++    Decoder *d = decoder_find(arg_x(c, 0));
++    OpusManager *m = d ? d->manager : NULL;
++    if (!m || m->used == m->slots) {
++        plat_mutex_unlock(&lock);
++        ret_x(c, OPUS_R_NO_BUFFER);
++        return;
++    }
++    OpusRequest *r = malloc(sizeof *r);
++    if (!r) rt_fatal("nn::codec: Opus request allocation");
++    r->next = NULL;
++    r->samples = -1;
++    r->packet_size = (int)(size - 8);
++    memcpy(r->packet, in + 8, r->packet_size);
++    if (d->tail) d->tail->next = r;
++    else d->head = r;
++    d->tail = r;
++    d->waiting++;
++    m->used++;
++    plat_mutex_unlock(&lock);
++    if (consumed) *consumed = size;
++    ret_x(c, 0);
++}
++
++static void ov_opus_execute(Cpu *c) {
++    plat_mutex_lock(&lock);
++    OpusManager *m = manager_find(arg_x(c, 0));
++    if (!m) { plat_mutex_unlock(&lock); ret_x(c, CODEC_R_INVALID); return; }
++    int decoded = 0;
++    for (Decoder *d = decoders; d; d = d->next) {
++        if (d->manager != m || !d->waiting) continue;
++        plat_mutex_lock(&d->use);
++        for (OpusRequest *r = d->head; r; r = r->next) {
++            if (r->samples >= 0) continue;
++            int samples = opus_decode(d->dec, r->packet, r->packet_size, r->pcm, OPUS_PCM_SAMPLES / d->channels, 0);
++            if (samples < 0) {
++                static int32_t warned;
++                if (!plat_xchg32(&warned, 1)) rt_log("nn::codec: queued Opus decode: %s", opus_strerror(samples));
++                samples = opus_decode(d->dec, NULL, 0, r->pcm, d->rate / 50, 0);
++                if (samples < 0) rt_fatal("nn::codec: Opus packet concealment failed");
++            }
++            r->samples = samples;
++            d->waiting--;
++            d->completed++;
++            decoded = 1;
++        }
++        release(d);
++    }
++    if (decoded) kern_signal_system_event(m->event);
++    plat_mutex_unlock(&lock);
++    ret_x(c, 0);
++}
++
++static void ov_opus_dequeue(Cpu *c) {
++    int *samples = arg_p(c, 1);
++    int16_t *out = arg_p(c, 2);
++    size_t capacity = arg_x(c, 3);
++    if (samples) *samples = 0;
++    plat_mutex_lock(&lock);
++    Decoder *d = decoder_find(arg_x(c, 0));
++    OpusRequest *r = d && d->completed ? d->head : NULL;
++    size_t bytes = r ? (size_t)r->samples * d->channels * sizeof *out : 0;
++    if (!r || !out || bytes > capacity) { plat_mutex_unlock(&lock); ret_x(c, OPUS_R_NO_BUFFER); return; }
++    d->head = r->next;
++    if (!d->head) d->tail = NULL;
++    d->completed--;
++    d->manager->used--;
++    plat_mutex_unlock(&lock);
++    memcpy(out, r->pcm, bytes);
++    if (samples) *samples = r->samples;
++    free(r);
++    ret_x(c, 0);
++}
++
++static void opus_request_count(Cpu *c, int completed) {
++    plat_mutex_lock_shared(&lock);
++    Decoder *d = decoder_find(arg_x(c, 0));
++    int n = d ? (completed ? d->completed : d->waiting) : 0;
++    plat_mutex_unlock_shared(&lock);
++    ret_x(c, n);
++}
++static void ov_opus_waiting(Cpu *c) { opus_request_count(c, 0); }
++static void ov_opus_completed(Cpu *c) { opus_request_count(c, 1); }
++static void ov_opus_executing(Cpu *c) { ret_x(c, 0); } // Execute returns once each packet finishes
++
+ // Result DecodeOpusInterleavedWithHardware(HardwareOpusDecoderType *d, size_t *consumed, int *samples, int16_t *out,
+ // size_t out_size, const void *in, size_t in_size). The input is Nintendo's frame: an 8-byte big-endian header
+ // {payload size, final range} and the Opus packet. A header range of 0 is not a recorded value (some encoders write 0
+@@ -173,3 +401,173 @@ HOST_OVERRIDE("_ZN2nn5codec32GetHardwareOpusDecoderSampleRateEPKNS0_23HardwareOp
+ HOST_OVERRIDE("_ZN2nn5codec34GetHardwareOpusDecoderChannelCountEPKNS0_23HardwareOpusDecoderTypeE", ov_channel_count);
+ HOST_OVERRIDE("_ZN2nn5codec24ResetHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", ov_reset);
+ HOST_OVERRIDE("_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm", ov_decode);
++HOST_OVERRIDE("_ZN2nn5codec43GetHardwareOpusDecoderManagerWorkBufferSizeEiiNS_8TimeSpanEii", ov_manager_work_size);
++HOST_OVERRIDE("_ZN2nn5codec36InitializeHardwareOpusDecoderManagerEPNS0_30HardwareOpusDecoderManagerTypeEPNS_2os15SystemEventTypeEiiNS_8TimeSpanEiiPvm", ov_manager_initialize);
++HOST_OVERRIDE("_ZN2nn5codec34FinalizeHardwareOpusDecoderManagerEPNS0_30HardwareOpusDecoderManagerTypeE", ov_manager_finalize);
++HOST_OVERRIDE("_ZN2nn5codec46GetHardwareOpusDecoderManagerFreeIoBufferCountEPKNS0_30HardwareOpusDecoderManagerTypeE", ov_manager_slots);
++HOST_OVERRIDE("_ZN2nn5codec29InitializeHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeEiiNS_8TimeSpanEPNS0_30HardwareOpusDecoderManagerTypeE", ov_managed_initialize);
++HOST_OVERRIDE("_ZN2nn5codec36EnqueueOpusDataToHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeEPmPKvm", ov_opus_enqueue);
++HOST_OVERRIDE("_ZN2nn5codec34ExecuteHardwareOpusDecoderDecodingEPNS0_30HardwareOpusDecoderManagerTypeE", ov_opus_execute);
++HOST_OVERRIDE("_ZN2nn5codec48DequeuePcmInterleavedDataFromHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeEPiPsm", ov_opus_dequeue);
++HOST_OVERRIDE("_ZN2nn5codec47GetHardwareOpusDecoderWaitingDecodeRequestCountEPKNS0_23HardwareOpusDecoderTypeE", ov_opus_waiting);
++HOST_OVERRIDE("_ZN2nn5codec49GetHardwareOpusDecoderExecutingDecodeRequestCountEPKNS0_23HardwareOpusDecoderTypeE", ov_opus_executing);
++HOST_OVERRIDE("_ZN2nn5codec49GetHardwareOpusDecoderCompletedDecodeRequestCountEPKNS0_23HardwareOpusDecoderTypeE", ov_opus_completed);
++
++// SDK 21's virtual output stream runs as a timed sink. It preserves frame capacity and
++// the stopped/started states so Wwise can pace the mixer during a headless boot.
++enum { STREAM_STOPPED = 1, STREAM_STARTED = 2 };
++typedef struct OutputStream {
++    uint64_t guest, event, last_ns;
++    int rate, capacity, queued, state;
++    struct OutputStream *next;
++} OutputStream;
++static OutputStream *streams;
++static PlatMutex stream_lock = PLAT_MUTEX_INIT;
++
++static OutputStream *stream_find(uint64_t guest) { // under stream_lock
++    OutputStream *s = streams;
++    while (s && s->guest != guest) s = s->next;
++    return s;
++}
++
++static void stream_drain(OutputStream *s) { // under stream_lock
++    if (s->state != STREAM_STARTED) return;
++    uint64_t now = kern_now_ns();
++    uint64_t elapsed = now - s->last_ns;
++    uint64_t frames = elapsed / 1000000000ull * s->rate + elapsed % 1000000000ull * s->rate / 1000000000ull;
++    if (frames >= (uint64_t)s->queued) {
++        s->queued = 0;
++        s->last_ns = now;
++    } else {
++        s->queued -= (int)frames;
++        s->last_ns += frames * 1000000000ull / s->rate;
++    }
++}
++
++static void ov_default_output_device(Cpu *c) {
++    static const char name[0x100] = "AudioVirtualOutput";
++    void *out = arg_p(c, 0);
++    if (!out) rt_fatal("nn::audio: null device name");
++    memcpy(out, name, sizeof name);
++}
++
++static void stream_open(Cpu *c, int has_event) {
++    uint64_t guest = arg_x(c, 0), event = has_event ? arg_x(c, 1) : 0;
++    const int32_t *fmt = arg_p(c, has_event ? 5 : 4);
++    int capacity = (int)arg_x(c, has_event ? 6 : 5);
++    if (!guest || !fmt || (fmt[0] != 2 && fmt[0] != 5) || fmt[1] <= 0 ||
++        (fmt[2] != 0 && fmt[2] != 48000) || capacity <= 0) { ret_x(c, CODEC_R_INVALID); return; }
++    plat_mutex_lock(&stream_lock);
++    if (stream_find(guest)) { plat_mutex_unlock(&stream_lock); ret_x(c, CODEC_R_INVALID); return; }
++    OutputStream *s = calloc(1, sizeof *s);
++    if (!s) rt_fatal("nn::audio: output stream allocation");
++    if (event) kern_bind_system_event(c, event, 1);
++    *s = (OutputStream){.guest = guest, .event = event, .rate = 48000, .capacity = capacity,
++                        .state = STREAM_STOPPED, .next = streams};
++    streams = s;
++    plat_mutex_unlock(&stream_lock);
++    rt_log("audio: virtual output stream, timed sink (%d channels, %d frames)", fmt[1], capacity);
++    ret_x(c, 0);
++}
++static void ov_stream_open(Cpu *c) { stream_open(c, 1); }
++static void ov_stream_open_no_event(Cpu *c) { stream_open(c, 0); }
++
++static int stream_start(OutputStream *s) { // under stream_lock
++    if (!s) return 0;
++    if (s->state == STREAM_STOPPED) {
++        s->state = STREAM_STARTED;
++        s->last_ns = kern_now_ns();
++        if (s->event) kern_signal_system_event(s->event);
++    }
++    return 1;
++}
++static void ov_stream_start(Cpu *c) {
++    plat_mutex_lock(&stream_lock);
++    int ok = stream_start(stream_find(arg_x(c, 0)));
++    plat_mutex_unlock(&stream_lock);
++    ret_x(c, ok ? 0 : CODEC_R_INVALID);
++}
++static void ov_stream_start_many(Cpu *c) {
++    const uint64_t *guests = arg_p(c, 0);
++    int count = (int)arg_x(c, 1);
++    if (count < 0 || (count && !guests)) { ret_x(c, CODEC_R_INVALID); return; }
++    plat_mutex_lock(&stream_lock);
++    int ok = 1;
++    for (int i = 0; i < count; i++) ok &= stream_find(guests[i]) != NULL;
++    if (ok) for (int i = 0; i < count; i++) stream_start(stream_find(guests[i]));
++    plat_mutex_unlock(&stream_lock);
++    ret_x(c, ok ? 0 : CODEC_R_INVALID);
++}
++static void ov_stream_stop(Cpu *c) {
++    plat_mutex_lock(&stream_lock);
++    OutputStream *s = stream_find(arg_x(c, 0));
++    if (s) { stream_drain(s); s->state = STREAM_STOPPED; }
++    plat_mutex_unlock(&stream_lock);
++}
++static void ov_stream_purge(Cpu *c) {
++    plat_mutex_lock(&stream_lock);
++    OutputStream *s = stream_find(arg_x(c, 0));
++    if (s) { s->queued = 0; s->last_ns = kern_now_ns(); }
++    plat_mutex_unlock(&stream_lock);
++}
++static void ov_stream_close(Cpu *c) {
++    uint64_t guest = arg_x(c, 0);
++    plat_mutex_lock(&stream_lock);
++    OutputStream **link = &streams;
++    while (*link && (*link)->guest != guest) link = &(*link)->next;
++    if (*link) {
++        OutputStream *s = *link;
++        *link = s->next;
++        kern_forget_system_event(s->event);
++        free(s);
++    }
++    plat_mutex_unlock(&stream_lock);
++}
++static void ov_stream_state(Cpu *c) {
++    plat_mutex_lock_shared(&stream_lock);
++    OutputStream *s = stream_find(arg_x(c, 0));
++    int state = s ? s->state : 0;
++    plat_mutex_unlock_shared(&stream_lock);
++    ret_x(c, state);
++}
++static void stream_frames(Cpu *c, int filled) {
++    plat_mutex_lock(&stream_lock);
++    OutputStream *s = stream_find(arg_x(c, 0));
++    int frames = 0;
++    if (s) { stream_drain(s); frames = filled ? s->queued : s->capacity - s->queued; }
++    plat_mutex_unlock(&stream_lock);
++    ret_x(c, frames);
++}
++static void ov_stream_free(Cpu *c) { stream_frames(c, 0); }
++static void ov_stream_filled(Cpu *c) { stream_frames(c, 1); }
++static void ov_stream_write(Cpu *c) {
++    int frames = (int)arg_x(c, 2);
++    plat_mutex_lock(&stream_lock);
++    OutputStream *s = stream_find(arg_x(c, 0));
++    if (s) stream_drain(s);
++    if (s && arg_x(c, 1) && frames > 0 && frames <= s->capacity - s->queued) s->queued += frames;
++    else frames = 0;
++    plat_mutex_unlock(&stream_lock);
++    ret_x(c, frames);
++}
++static void ov_stream_gain(Cpu *c) { (void)c; }  // a silent sink has no gain
++static void ov_stream_stats(Cpu *c) {
++    void *out = (void *)(uintptr_t)c->x[8];
++    if (out) memset(out, 0, 24);
++}
++
++HOST_OVERRIDE("_ZN2nn5audio29GetDefaultVirtualOutputDeviceEPNS0_15AudioDeviceNameE", ov_default_output_device);
++HOST_OVERRIDE("_ZN2nn5audio6detail29GetDefaultVirtualOutputDeviceEPNS0_15AudioDeviceNameE", ov_default_output_device);
++HOST_OVERRIDE("_ZN2nn5audio16OpenOutputStreamEPNS0_16OutputStreamTypeEPNS_2os11SystemEventEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEiiNS_4util10BitFlagSetILi32ENS0_16OutputStreamFlagEEE", ov_stream_open);
++HOST_OVERRIDE("_ZN2nn5audio16OpenOutputStreamEPNS0_16OutputStreamTypeEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEiNS_4util10BitFlagSetILi32ENS0_16OutputStreamFlagEEE", ov_stream_open_no_event);
++HOST_OVERRIDE("_ZN2nn5audio17StartOutputStreamEPNS0_16OutputStreamTypeE", ov_stream_start);
++HOST_OVERRIDE("_ZN2nn5audio18StartOutputStreamsEPKPNS0_16OutputStreamTypeEi", ov_stream_start_many);
++HOST_OVERRIDE("_ZN2nn5audio16StopOutputStreamEPNS0_16OutputStreamTypeE", ov_stream_stop);
++HOST_OVERRIDE("_ZN2nn5audio17PurgeOutputStreamEPNS0_16OutputStreamTypeE", ov_stream_purge);
++HOST_OVERRIDE("_ZN2nn5audio17CloseOutputStreamEPNS0_16OutputStreamTypeE", ov_stream_close);
++HOST_OVERRIDE("_ZN2nn5audio20GetOutputStreamStateEPKNS0_16OutputStreamTypeE", ov_stream_state);
++HOST_OVERRIDE("_ZN2nn5audio29GetOutputStreamFreeFrameCountEPKNS0_16OutputStreamTypeE", ov_stream_free);
++HOST_OVERRIDE("_ZN2nn5audio31GetOutputStreamFilledFrameCountEPKNS0_16OutputStreamTypeE", ov_stream_filled);
++HOST_OVERRIDE("_ZN2nn5audio17WriteOutputStreamEPNS0_16OutputStreamTypeEPKvi", ov_stream_write);
++HOST_OVERRIDE("_ZN2nn5audio19SetOutputStreamGainEPNS0_16OutputStreamTypeEfNS_8TimeSpanE", ov_stream_gain);
++HOST_OVERRIDE("_ZN2nn5audio25GetOutputStreamStatisticsEPNS0_16OutputStreamTypeEb", ov_stream_stats);
+diff --git a/runtime/ov_system.c b/runtime/ov_system.c
+index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..044e5d77d257c791f99a4a585da0d901907e6181 100644
+--- a/runtime/ov_system.c
++++ b/runtime/ov_system.c
+@@ -121,6 +121,37 @@ static void ov_desired_language(Cpu *c) {
+ 
+ static void ov_oe_initialize(Cpu *c) { (void)c; rt_log("oe: application environment: a local host process"); }
+ 
++// Stable per-profile application UUID, without a console identity or a network service.
++static void ov_pseudo_device_id(Cpu *c) {
++    void *out = arg_p(c, 0);
++    if (!out) rt_fatal("nn::oe::GetPseudoDeviceId: null output");
++    uint64_t seed[3] = {0, 0, RT_APPLICATION_ID};
++    uint8_t hash[32];
++    account_uid(seed);
++    rt_sha256(seed, sizeof seed, hash);
++    hash[6] = (hash[6] & 0x0f) | 0x80;
++    hash[8] = (hash[8] & 0x3f) | 0x80;
++    memcpy(out, hash, 16);
++    ret_x(c, 0);
++}
++
++// This profile contains only statically linked modules; nnMain handles an absent optional NRR.
++static void ov_ro_initialize(Cpu *c) { (void)c; rt_log("ro: static modules only"); }
++static void ov_ro_finalize(Cpu *c) { (void)c; }
++static void ov_ro_dynamic(Cpu *c) { (void)c; rt_fatal("ro: dynamic module registration is unavailable"); }
++
++static void ov_crypto_random(Cpu *c) {
++    uint8_t *out = arg_p(c, 0);
++    uint64_t left = arg_x(c, 1);
++    if (!out && left) rt_fatal("csrng: null output");
++    while (left) {
++        size_t chunk = left > UINT32_MAX ? UINT32_MAX : (size_t)left;
++        if (!plat_random(out, chunk)) rt_fatal("csrng: no random bytes from the system");
++        out += chunk;
++        left -= chunk;
++    }
++}
++
+ // void SetPerformanceConfiguration(PerformanceMode mode, int config)
+ static void ov_performance_config(Cpu *c) {
+     int64_t mode = (int32_t)arg_x(c, 0);
+@@ -296,6 +327,28 @@ static void ov_nfp_availability(Cpu *c) {
+ static void ov_nfp_no_device(Cpu *c) { ret_x(c, NFP_R_DEVICE_NOT_FOUND); }
+ static void ov_nfp_device_state(Cpu *c) { ret_x(c, 0); }   // DeviceState GetDeviceState(const DeviceHandle &): none
+ 
++// Offline queues stay empty. Their borrowed events remain unsignalled for the process lifetime.
++static PlatMutex offline_event_lock = PLAT_MUTEX_INIT;
++static uint64_t purchase_event, invitation_event;
++static void ov_offline_queue_lifecycle(Cpu *c) { (void)c; }
++static void offline_queue_event(Cpu *c, uint64_t *event) {
++    plat_mutex_lock(&offline_event_lock);
++    if (!*event) {
++        *event = (uintptr_t)mem_kernel_alloc(0x80, 16);
++        kern_bind_system_event(c, *event, 0);
++    }
++    plat_mutex_unlock(&offline_event_lock);
++    ret_x(c, *event);
++}
++static void ov_purchase_event(Cpu *c) { offline_queue_event(c, &purchase_event); }
++static void ov_invitation_event(Cpu *c) { offline_queue_event(c, &invitation_event); }
++static void ov_offline_queue_pop(Cpu *c) { ret_x(c, 0); }
++
++static void ov_chat_initialize(Cpu *c) { (void)c; rt_log("chat: offline, no active session"); }
++static void ov_chat_uid(Cpu *c) { ret_x(c, 0); c->x[1] = 0; }
++static void ov_chat_fail(Cpu *c) { ret_x(c, 1); }
++static void ov_chat_bufsize(Cpu *c) { ret_x(c, 0x1000); }
++
+ // void err::ShowError(Result): the game's error dialog, logged
+ static void ov_show_error(Cpu *c) {
+     uint32_t r = (uint32_t)arg_x(c, 0);
+@@ -808,16 +861,64 @@ static void ov_graphics_scale(Cpu *c) { ret_x(c, 2); }
+ static void ov_graphics_scale_notify(Cpu *c) { (void)c; }
+ // void nn::oe::SetAlbumImageOrientation(album::ImageOrientation): there is no capture album
+ static void ov_album_orientation(Cpu *c) { (void)c; }
++// The host does not publish system album capture notifications.
++static void ov_album_notify(Cpu *c) { (void)c; }
+ // void nn::oe::{Enter,Leave}ExitRequestHandlingSection(): no exit request ever arrives from a host system applet
+ static void ov_exit_section(Cpu *c) { (void)c; }
+ 
+ HOST_OVERRIDE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", ov_graphics_scale);
+ HOST_OVERRIDE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", ov_graphics_scale_notify);
+ HOST_OVERRIDE("_ZN2nn2oe24SetAlbumImageOrientationENS_5album16ImageOrientationE", ov_album_orientation);
++HOST_OVERRIDE("_ZN2nn2oe33EnableAlbumImageTakenNotificationEv", ov_album_notify);
++HOST_OVERRIDE("_ZN2nn2oe34DisableAlbumImageTakenNotificationEv", ov_album_notify);
+ HOST_OVERRIDE("_ZN2nn2oe31EnterExitRequestHandlingSectionEv", ov_exit_section);
+ HOST_OVERRIDE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", ov_exit_section);
+ 
+ HOST_OVERRIDE("_ZN2nn2oe10InitializeEv", ov_oe_initialize);
++HOST_OVERRIDE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", ov_pseudo_device_id);
++HOST_OVERRIDE("_ZN2nn2ro10InitializeEv", ov_ro_initialize);
++HOST_OVERRIDE("_ZN2nn2ro8FinalizeEv", ov_ro_finalize);
++HOST_OVERRIDE("_ZN2nn2ro18RegisterModuleInfoEPNS0_16RegistrationInfoEPKv", ov_ro_dynamic);
++HOST_OVERRIDE("_ZN2nn2ro20UnregisterModuleInfoEPNS0_16RegistrationInfoE", ov_ro_dynamic);
++HOST_OVERRIDE("_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", ov_crypto_random);
++HOST_OVERRIDE("_ZN2nn2ec24InitializePurchasedEventEv", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn2ec22FinalizePurchasedEventEv", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn2ec17GetPurchasedEventEv", ov_purchase_event);
++HOST_OVERRIDE("_ZN2nn2ec20PopPurchasedItemInfoEPNS0_17PurchasedItemInfoE", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn7friends36GetFriendInvitationNotificationEventEv", ov_invitation_event);
++HOST_OVERRIDE("_ZN2nn7friends38TryPopFriendInvitationNotificationInfoEPNS_7account3UidEPmPvm", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat10InitializeEv", ov_chat_initialize);
++HOST_OVERRIDE("_ZN2nn4chat14GetChattingUidEv", ov_chat_uid);
++HOST_OVERRIDE("_ZN2nn4chat13SetSharingKeyERKNS0_10SharingKeyE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat15ClearSharingKeyEv", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat11GetRoomInfoEPNS0_8RoomInfoE", ov_chat_fail);
++HOST_OVERRIDE("_ZN2nn4chat13ShowChatStartERKNS_7account3UidE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat19EnableVirtualCameraEPNS0_17VirtualCameraTypeE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat20DisableVirtualCameraEPNS0_17VirtualCameraTypeE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat21FinalizeVirtualCameraEPNS0_17VirtualCameraTypeE", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat22GetRealtimeAudioLevelsEPNS0_10AudioLevelEiPKNS_7account23NetworkServiceAccountIdEi", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat22ShowCameraSharingGuideEv", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat23InitializeVirtualCameraEPNS0_17VirtualCameraTypeE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat24StopLocalCameraStreamingEv", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat25GetLocalCameraImageHandleEPKNS0_20LocalCameraVideoTypeEi", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat25StartLocalCameraStreamingEv", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat25StopRemoteCameraStreamingERKNS_7account23NetworkServiceAccountIdE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat26GetRemoteCameraImageHandleEPKNS0_21RemoteCameraVideoTypeEi", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat26StartRemoteCameraStreamingERKNS_7account23NetworkServiceAccountIdE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat27RequestNextLocalCameraImageEPNS_2gs16NativeSyncHandleEPNS0_20LocalCameraVideoTypeEiS2_", ov_chat_fail);
++HOST_OVERRIDE("_ZN2nn4chat28RequestNextRemoteCameraImageEPNS_2gs16NativeSyncHandleEPNS0_21RemoteCameraVideoTypeEiS2_RKNS_7account23NetworkServiceAccountIdE", ov_chat_fail);
++HOST_OVERRIDE("_ZN2nn4chat28ShowLocalCameraConfigurationENS0_25CameraImageProcessingModeE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat31FinalizeLocalCameraVideoStorageEPNS0_20LocalCameraVideoTypeE", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat32FinalizeRemoteCameraVideoStorageEPNS0_21RemoteCameraVideoTypeE", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat33InitializeLocalCameraVideoStorageEPNS0_20LocalCameraVideoTypeEiiiPvm", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat34GetVirtualCameraNativeWindowHandleEPKNS0_17VirtualCameraTypeE", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat34InitializeRemoteCameraVideoStorageEPNS0_21RemoteCameraVideoTypeEiiiPvm", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn4chat35CalculateLocalCameraVideoBufferSizeEiii", ov_chat_bufsize);
++HOST_OVERRIDE("_ZN2nn4chat36CalculateRemoteCameraVideoBufferSizeEiii", ov_chat_bufsize);
++HOST_OVERRIDE("_ZN2nn4chat43SetVirtualCameraContainPhotographedContentsEPNS0_17VirtualCameraTypeEb", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat44EndFullScreenWithLocalCameraAvailableSectionEv", ov_offline_queue_lifecycle);
++HOST_OVERRIDE("_ZN2nn4chat44GetCameraImageProcessingModeForVirtualCameraEv", ov_offline_queue_pop);
++HOST_OVERRIDE("_ZN2nn4chat46BeginFullScreenWithLocalCameraAvailableSectionEb", ov_result_ok);
+ HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
+ HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
+ HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);
+@@ -1079,3 +1180,4 @@ HOST_OVERRIDE("_ZN2nn6socket4PollEP6pollfdmi", ov_socket_poll);
+ HOST_OVERRIDE("_ZN2nn6socket6detail4PollEPNS0_6PollFdEmi", ov_socket_poll);
+ HOST_OVERRIDE("_ZN2nn6socket6detail4PollEP6pollfdmi", ov_socket_poll);
+ 
++
+diff --git a/runtime/romfs.c b/runtime/romfs.c
+index b30e20e1c5457cd107e4a7f9838286723db27312..26593509f220de9b3e09a6b2f98f65e9b7cdbb38 100644
+--- a/runtime/romfs.c
++++ b/runtime/romfs.c
+@@ -658,6 +658,16 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
+         done += (uint64_t)r;
+     }
+     *out = done;
++    if ((rt_trace & RT_TRACE_FS) && done && !rt_game_version && f == image && base == 0) {
++        static volatile int32_t reads;
++        if (plat_cas32(&reads, 0, 0) < 8 && plat_inc32(&reads) <= 8)
++            rt_log("fs: archive read at %#llx (%llu bytes)", (unsigned long long)offset, (unsigned long long)done);
++    }
++    if (rt_config()->boot && !offset && done >= 4 && f == image && base == 0 && file_count &&
++        !strcmp(entry_name(entry(0)), "data.zip")) {
++        if (memcmp(buffer, "VZIP", 4)) rt_fatal("boot: data.zip has no VZIP signature");
++        rt_boot_archive_read(done);
++    }
+     return 0;
+ }
+ 
+diff --git a/runtime/svc.c b/runtime/svc.c
+index acd8a67c088c38d9919e1a3bc0aa44b09d0f7ca1..47e212f1a3010d99da7317a76db900674fd46acb 100644
+--- a/runtime/svc.c
++++ b/runtime/svc.c
+@@ -218,6 +218,8 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
+                    // profile saved, logs flushed, exit code 0
+         char at[160];
+         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
++        if (!rt_game_version && rt_config()->boot && !rt_config()->seconds)
++            rt_fatal("boot: guest exited before the requested checkpoints");
+         fs_save_flush();
+         vk_pipeline_save();
+         prof_write();
+diff --git a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index c92cd68134caf7ca53ab48118a125b969489a3e3..f4cf00a5e44ad4c66ac15869a1ddf5cc484900d8 100644
+--- a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -122,7 +122,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+         case 0x220: case 0xa20: case 0x221: case 0x421: case 0x621:
+         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23:
+         case 0x243: case 0x245: case 0x306:
+-        case 0x919: case 0xc12: case 0x300: case 0x210: case 0x308:
++        case 0x919: case 0xc12: case 0x300: case 0x210: case 0x308: case 0x81a: case 0x21a:
+             return instruction.Bits(16, 8) == 255 ? 0U : 1U;
+         case 0x225: case 0x625: case 0x825:
+             return 2;
+@@ -3148,6 +3148,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                  (u64{insn.Bits(76, 2)} << 52) | (u64{insn.Bits(78, 1)} << 55));
+             break;
+         }
++        case 0x21a: {
++            if ((insn.words[2] & ~0x200U) || dest >= 255)
++                return fail(index, "native sign extend register mode");
++            const u32 src_b = insn.Bits(32, 8);
++            emit(0x3848000000000000ULL | predicate | 250 | (u64{src_b} << 8) | (u64{8} << 20));
++            emit(base(0x5c00000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
++                 (u64{250} << 20) | (u64{insn.Bits(73, 1)} << 48));
++            break;
++        }
+         case 0x81a: {
+             if ((insn.words[2] & ~0x200U) || insn.words[1] > 32 || dest >= 255)
+                 return fail(index, "native sign extend mode");
+diff --git a/runtime/vk_exec.c b/runtime/vk_exec.c
+index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2aa476d650 100644
+--- a/runtime/vk_exec.c
++++ b/runtime/vk_exec.c
+@@ -1000,6 +1000,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
+         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
+         case OP_BARRIER: vk_exec_barrier(ex); break;
+         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
++        case OP_FENCE_SYNC: break;  // the queue front end publishes the submitted fence
+         case OP_DRAW_MESH: case OP_DRAW_MESH_IND: vk_exec_op_draw(ex, h->op, a); break;
+         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
+             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
+diff --git a/runtime/vk_exec_draw.c b/runtime/vk_exec_draw.c
+index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a65f71818813d548945d49c43e74114080a62797 100644
+--- a/runtime/vk_exec_draw.c
++++ b/runtime/vk_exec_draw.c
+@@ -3599,12 +3599,14 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
+ // lost the device on an RTX 5090 (an invalid instruction pointer, the same address in every run). Such a giant is replaced
+ // (this NVN 2 stage only) by a blit from its largest sampled texture to the image it writes. 1 when it was. ponytail: bilinear, not the game's
+ // filter; lower the shader's size instead when that is understood. TOTK_BIG_CS=0 runs it.
+-static int big_compute_blit(VkExec *ex, const GfxShader *cs, const VkPipeInfo *info) {
++static int big_compute_blit(VkExec *ex, const GfxShader *cs) {
+     uint64_t words = 0;
+     gfx_shader_spirv(cs, &words);
+     const uint8_t *bctl, *bcode = NULL;
+     uint32_t blen;
+-    if (!find_stage(ex->prog, NVN_STAGE_CS, &bctl, &bcode, &blen) || nvn2_origin(bcode) != 0xfd029a317a9a4b94ull) return 0;
++    if (!find_stage(ex->prog, NVN_STAGE_CS, &bctl, &bcode, &blen)) return 0;
++    uint64_t org = nvn2_origin(bcode);
++    if (org != 0xfd029a317a9a4b94ull && org != 0xe0aecd990ba0f86cull) return 0;
+     static int on = -1;
+     if (on < 0) {
+         const char *e = getenv("TOTK_BIG_CS");
+@@ -3612,28 +3614,51 @@ static int big_compute_blit(VkExec *ex, const GfxShader *cs, const VkPipeInfo *i
+     }
+     if (!on) return 0;
+     const VkTexImage *src = NULL, *dst = NULL;
+-    for (uint32_t i = 0; i < info->n_bindings; i++) {
+-        const VkPipeBinding *bd = &info->bindings[i];
+-        if (!bd->res || (bd->kind != GFX_RES_TEX && bd->kind != GFX_RES_IMG)) continue;
+-        int slot = bd->res->slot, img = bd->kind == GFX_RES_IMG;
+-        uint64_t h = img ? (slot >= 0 && slot < 32 ? ex->img[5][slot] : 0) : (slot >= 0 && slot < 128 ? ex->tex[5][slot] : 0);
++    const GfxShaderRes *r;
++    int n = gfx_shader_resources(cs, GFX_RES_IMG, &r);
++    for (int j = 0; j < n; j++) {
++        int slot = r[j].slot;
++        uint64_t h = slot >= 0 && slot < 32 ? ex->img[5][slot] : 0;
++        view_t v;
++        int hv = 0;
++        const VkTexImage *t = h ? vk_texture_by_id(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv) : NULL;
++        if (t && (r[j].flags & 4)) dst = t;
++    }
++    n = gfx_shader_resources(cs, GFX_RES_TEX, &r);
++    for (int j = 0; j < n; j++) {
++        int slot = r[j].slot;
++        uint64_t h = slot >= 0 && slot < 128 ? ex->tex[5][slot] : 0;
+         view_t v;
+         int hv = 0;
+         const VkTexImage *t = h ? vk_texture_by_id(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv) : NULL;
+         if (!t) continue;
+-        if (img && (bd->res->flags & 4)) dst = t;
+-        else if (!img && t->type == VK_IMAGE_TYPE_2D && !(t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+-                 (!src || (uint64_t)t->width * t->height > (uint64_t)src->width * src->height))
++        if (t->type == VK_IMAGE_TYPE_2D && !(t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
++            (!src || (uint64_t)t->width * t->height > (uint64_t)src->width * src->height))
+             src = t;
+     }
+     static int logged;
+     if (!logged) {
+         logged = 1;
+-        rt_log("vk: LOCAL TEST: a compute shader of %llu words is replaced by a blit (%ux%u format %d to %ux%u format %d)",
+-               (unsigned long long)words, src ? src->width : 0, src ? src->height : 0, src ? (int)src->format : 0,
++        rt_log("vk: LOCAL TEST: a compute shader of %llu words origin %016llx is replaced by a blit (%ux%u format %d to %ux%u format %d)",
++               (unsigned long long)words, (unsigned long long)org,
++               src ? src->width : 0, src ? src->height : 0, src ? (int)src->format : 0,
+                dst ? dst->width : 0, dst ? dst->height : 0, dst ? (int)dst->format : 0);
+     }
+     if (!src || !dst) return 1;
++    if (org != 0xfd029a317a9a4b94ull) {
++        vk_exec_barrier(ex);
++        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++                          .srcOffsets = {{0, 0, 0}, {(int32_t)src->width, (int32_t)src->height, 1}},
++                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++                          .dstOffsets = {{0, 0, 0}, {(int32_t)dst->width, (int32_t)dst->height, 1}}};
++        vkCmdBlitImage(ex->cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
++        ex->recorded++;
++        vk_texture_lock();
++        vk_texture_storage_bound_locked(dst);
++        vk_texture_unlock();
++        vk_exec_barrier(ex);
++        return 1;
++    }
+     vk_exec_barrier(ex);
+     // The tone map stores the square root of the colour as RGB9E5 by hand in an image of format r11g11b10f: its bits go to
+     // an image of the real format first, and a small compute pass squares them on the way to the target.
+@@ -3745,6 +3770,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+         }
+         return;
+     }
++    if (big_compute_blit(ex, cs)) return;
+     {   // LOCAL TEST (Ocarina): each compute program's first dispatch, and DKB_SKIP_CS=<hex origin,...> leaves some out
+         static uint64_t seen[1024], skip[32];
+         static int nseen, nskip, init;
+@@ -3823,7 +3849,6 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+     const VkPipeInfo *info = NULL;
+     VkPipeline p = vk_pipeline_compute(cs, &info);
+     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
+-    if (big_compute_blit(ex, cs, info)) return;
+     vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
+     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
+diff --git a/runtime/vk_texture.c b/runtime/vk_texture.c
+index fb70efa6842fa0e3b756041bbe6af75799644c41..5a9b4bad9ba3c2474c6dbf048f142b98e1e201ce 100644
+--- a/runtime/vk_texture.c
++++ b/runtime/vk_texture.c
+@@ -632,6 +632,17 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
+ }
+ 
+ // Copies the whole storage into the image (every level and layer the image has).
++static inline uint16_t lut_float_to_half(float f) {
++    uint32_t x;
++    memcpy(&x, &f, 4);
++    uint32_t sign = (x >> 16) & 0x8000;
++    int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
++    uint32_t mant = (x >> 13) & 0x3ff;
++    if (exp <= 0) return (uint16_t)sign;
++    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
++    return (uint16_t)(sign | (exp << 10) | mant);
++}
++
+ static void upload(Tex *e) {
+     static volatile int32_t n_bad, n_undecoded;
+     const tex_t *t = &e->t;
+@@ -688,6 +699,39 @@ static void upload(Tex *e) {
+             } else {
+                 rg[k].bufferRowLength = rb / (uint32_t)bpb * (uint32_t)bw, rg[k].bufferImageHeight = rows * (uint32_t)bh;
+             }
++            if (is3d && e->f.vk == VK_FORMAT_R16G16B16A16_SFLOAT) {
++                int has_data = 0;
++                const uint64_t *d64 = (const uint64_t *)dst;
++                for (size_t wi = 0; wi < raw / 8; wi++) {
++                    if (d64[wi]) { has_data = 1; break; }
++                }
++                if (!has_data) {
++                    static int logged_lut;
++                    if (!logged_lut) {
++                        logged_lut = 1;
++                        rt_log("vk: 3D LUT at %#llx (%ux%ux%u) is all zeros; replacing with identity LUT",
++                               (unsigned long long)e->pub.addr, w, h, sl);
++                    }
++                    uint16_t *f16 = (uint16_t *)dst;
++                    for (uint32_t z = 0; z < sl; z++) {
++                        float fz = sl > 1 ? (float)z / (float)(sl - 1) : 0.0f;
++                        uint16_t b = lut_float_to_half(fz);
++                        for (uint32_t y = 0; y < h; y++) {
++                            float fy = h > 1 ? (float)y / (float)(h - 1) : 0.0f;
++                            uint16_t g = lut_float_to_half(fy);
++                            for (uint32_t x = 0; x < w; x++) {
++                                float fx = w > 1 ? (float)x / (float)(w - 1) : 0.0f;
++                                uint16_t r = lut_float_to_half(fx);
++                                size_t idx = ((size_t)z * h * w + (size_t)y * w + x) * 4;
++                                f16[idx + 0] = r;
++                                f16[idx + 1] = g;
++                                f16[idx + 2] = b;
++                                f16[idx + 3] = 0x3c00;
++                            }
++                        }
++                    }
++                }
++            }
+             free(tmp);
+         }
+     uint8_t *raw_copy = acheck ? malloc(total) : NULL;
