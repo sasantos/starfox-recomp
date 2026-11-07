@@ -45,7 +45,7 @@ $py = '.\.venv\Scripts\python.exe'
 $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 $env:TOTK_INPUT = 'none'
 $env:TOTK_GPU = 'null'
-& .\build\phase1-base\ocarina.exe --selftest
+& .\build\phase1-base\starfox.exe --selftest
 ```
 
-O build aplica o patch cumulativo da fase atual ao checkout local ignorado `refs/ocarina` e reutiliza os objetos compilados nas execuções seguintes. O executável mantém o nome `ocarina.exe` do script upstream. O autoteste funciona sem montar o RomFS. A [Fase 3](FASE-3.md) atualiza os resultados de cobertura da CPU.
+O build aplica o patch cumulativo da fase atual ao checkout local ignorado `refs/ocarina` e reutiliza os objetos compilados nas execuções seguintes. O executável gerado é `starfox.exe`. O autoteste funciona sem montar o RomFS. A [Fase 3](FASE-3.md) atualiza os resultados de cobertura da CPU.

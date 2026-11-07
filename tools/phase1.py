@@ -53,7 +53,7 @@ def verify_inputs():
         ["git", "-C", str(REFERENCE), "rev-parse", "HEAD"], text=True
     ).strip()
     if reference != REFERENCE_COMMIT:
-        raise ValueError(f"Revisão de Ocarina inesperada: {reference}")
+        raise ValueError(f"Revisão da referência inesperada: {reference}")
     reference_patch()
     return profile
 

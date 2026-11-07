@@ -29,8 +29,8 @@ $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 $env:TOTK_GPU = 'null'
 $env:TOTK_INPUT = 'none'
 $env:TOTK_TRACE = 'fs'
-& .\build\phase1-base\ocarina.exe --selftest
-& .\build\phase1-base\ocarina.exe --boot *> .\build\phase2-boot.log
+& .\build\phase1-base\starfox.exe --selftest
+& .\build\phase1-base\starfox.exe --boot *> .\build\phase2-boot.log
 $bootExit = $LASTEXITCODE
 Get-Content .\build\phase2-boot.log -Tail 20
 $bootExit

@@ -1,6 +1,6 @@
-# Star Fox Recomp
+# Star Fox Remake Recomp
 
-Projeto experimental para recompilar estaticamente o Star Fox de Nintendo Switch 2 (`0400E88025B1A000`) e rodá-lo no Windows x64. O primeiro alvo é a campanha solo offline do pacote base, com renderização Vulkan. Na Fase 3, o jogo carrega recursos do dump e executa envios NVN e apresentações consecutivas no backend nulo.
+Projeto experimental para recompilar estaticamente o Star Fox Remake de Nintendo Switch 2 (`0400E88025B1A000`) e rodá-lo no Windows x64. O primeiro alvo é a campanha solo offline do pacote base, com renderização Vulkan. Na Fase 3, o jogo carrega recursos do dump e executa envios NVN e apresentações consecutivas no backend nulo.
 
 - [Plano por fases](docs/PLANO.md) com entregáveis, critérios de saída e revisões das referências.
 - [Diagnóstico inicial](docs/FASE-0.md) com o que foi medido no dump e os pontos de integração já identificados.

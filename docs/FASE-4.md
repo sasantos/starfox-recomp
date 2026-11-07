@@ -30,7 +30,7 @@ $env:TOTK_INPUT = 'none'
 $env:TOTK_AUDIO = 'none'
 $env:TOTK_TRACE = 'gfx,present,fs,ipc'
 $env:TOTK_XLATE = (Resolve-Path .\build\xlate\totk_xlate.exe).Path
-& .\build\phase1-base\ocarina.exe --probe-vulkan-boot --profile .\build\phase3-validation-profile --shot .\build\first-frame.png *> .\build\phase4-vulkan-boot.log
+& .\build\phase1-base\starfox.exe --probe-vulkan-boot --profile .\build\phase3-validation-profile --shot .\build\first-frame.png *> .\build\phase4-vulkan-boot.log
 $bootExit = $LASTEXITCODE
 Get-Content .\build\phase4-vulkan-boot.log -Tail 15
 $bootExit

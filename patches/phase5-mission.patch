@@ -306,11 +306,39 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..225d77da929f9bd9848ce4e0d2d8dab0
      if (s->has_c0 && (r->cbuf_slot <= 0 || r->cbuf_slot == 2)) {   // NVN 2 compute: packed-bank handles, 8 bytes each
          int bytes = (handle & 0x3fff) * 4, at = (int)nvn2_c0_part(&s->c0, kind == GFX_RES_IMG ? 4 : 3);
          int n = kind == GFX_RES_IMG ? s->c0.images : s->c0.textures;
+diff --git a/runtime/gfx_window_sdl.c b/runtime/gfx_window_sdl.c
+index b1978c6155eba19e3811f0b25912c71b3eb2d9f9..c2c753f58a252301d6cb2415a679d55bf25bd218 100644
+--- a/runtime/gfx_window_sdl.c
++++ b/runtime/gfx_window_sdl.c
+@@ -253,7 +253,7 @@ static void open_window(void *arg) {
+     (void)arg;
+     int w, h;
+     gfx_cfg_window_size(&w, &h);
+-    g_win = SDL_CreateWindow("Ocarina Recomp", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
++    g_win = SDL_CreateWindow("Star Fox Remake Recomp", w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+     if (!g_win) {
+         rt_log("gfx: SDL_CreateWindow failed (%s)", SDL_GetError());
+         return;
 diff --git a/runtime/gfx_window_win.c b/runtime/gfx_window_win.c
-index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..3773c681cca341419ba5e7694a7c4755a07b4e67 100644
+index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..6a11272fb7a7f50b331b33cec6802e080285eb2a 100644
 --- a/runtime/gfx_window_win.c
 +++ b/runtime/gfx_window_win.c
-@@ -306,13 +306,17 @@ static void window_main(void *arg) {
+@@ -208,7 +208,7 @@ static void miojo_key(HWND h, WPARAM w, LPARAM l) {
+     at = w == (WPARAM)name[at] ? at + 1 : w == 'M';
+     if (name[at]) return;
+     at = 0;
+-    SetWindowTextW(h, L"Ocarina Recomp - feito com miojo");
++    SetWindowTextW(h, L"Star Fox Remake Recomp - feito com miojo");
+     menu_miojo();
+ }
+ 
+@@ -301,18 +301,22 @@ static void window_main(void *arg) {
+                                           GetSystemMetrics(SM_CYICON), LR_SHARED),
+                       .hIconSm = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
+-                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
++                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"StarFoxRecompWindow"};
+     RegisterClassExW(&wc);
      int cw, ch, ow, oh;
      cfg_window_size(&cw, &ch);
      outer_size(NULL, cw, ch, &ow, &oh);
@@ -325,7 +353,7 @@ index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..3773c681cca341419ba5e7694a7c4755
      // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
      int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
 -    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Ocarina Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
-+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Star Fox (Nintendo Switch 2)", WND_STYLE, pos_x, pos_y, ow, oh, NULL,
++    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Star Fox Remake (Nintendo Switch 2)", WND_STYLE, pos_x, pos_y, ow, oh, NULL,
                               NULL, inst, NULL);
      if (!g_hwnd) {
          rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
@@ -2603,6 +2631,19 @@ index acd8a67c088c38d9919e1a3bc0aa44b09d0f7ca1..47e212f1a3010d99da7317a76db90067
          fs_save_flush();
          vk_pipeline_save();
          prof_write();
+diff --git a/runtime/sysinfo.c b/runtime/sysinfo.c
+index adb9abcf8cb2aa347d7b8c5fb331928e66d35c1f..53c06511884bf7aab09e0d2a794dd7acfcf5d1b5 100644
+--- a/runtime/sysinfo.c
++++ b/runtime/sysinfo.c
+@@ -61,7 +61,7 @@ int sysinfo_text(char *buf, size_t n) {
+     Out o = {buf, n, 0};
+     buf[0] = 0;
+     char s[256];
+-    put(&o, "TotK Recomp system info\n");
++    put(&o, "Star Fox Remake Recomp system info\n");
+     put(&o, "OS: %s\n", plat_os_version(s, sizeof s) ? s : "unknown");
+     sysinfo_cpu_name(s, sizeof s);
+     put(&o, "CPU: %s, %u logical processors\n", s[0] ? s : "unknown", plat_cpu_count());
 diff --git a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 index c92cd68134caf7ca53ab48118a125b969489a3e3..89e813351cb45495f2f5f56498fbd4f965947bfd 100644
 --- a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
@@ -2654,6 +2695,28 @@ index c92cd68134caf7ca53ab48118a125b969489a3e3..89e813351cb45495f2f5f56498fbd4f9
          case 0x81a: {
              if ((insn.words[2] & ~0x200U) || insn.words[1] > 32 || dest >= 255)
                  return fail(index, "native sign extend mode");
+diff --git a/runtime/ui_text.c b/runtime/ui_text.c
+index 95a22732d466bff2582334865006be33492e634c..6c89ce3a1fe063b2851a494ca9389650d7c33d5f 100644
+--- a/runtime/ui_text.c
++++ b/runtime/ui_text.c
+@@ -33,7 +33,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
+     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
+     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
+     [UI_MENU_SAVE_FAILED] = "could not save settings",
+-    [UI_MENU_VERSION] = "Ocarina Recomp %s, game %s",
++    [UI_MENU_VERSION] = "Star Fox Remake Recomp %s, game %s",
+ 
+     [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Fills the screen with the game; F11 toggles it.",
+     [UI_MENU_WINDOW_SIZE] = "Window size", [UI_MENU_WINDOW_SIZE_DESC] = "Size of the game window when not fullscreen.",
+@@ -292,7 +292,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
+     [UI_MENU_DEFAULT_MARK] = "по умолчанию",
+     [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
+     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
+-    [UI_MENU_VERSION] = "Ocarina Recomp %s, игра %s",
++    [UI_MENU_VERSION] = "Star Fox Remake Recomp %s, игра %s",
+ 
+     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран; F11 переключает режим.",
+     [UI_MENU_WINDOW_SIZE] = "Размер окна", [UI_MENU_WINDOW_SIZE_DESC] = "Размер окна игры вне полноэкранного режима.",
 diff --git a/runtime/vk.h b/runtime/vk.h
 index 4183228a9ba5c1459ebe71e1f55b4a0421ce343f..65405635df857bce2c3a235be1c69d186b67f4ce 100644
 --- a/runtime/vk.h
@@ -2720,6 +2783,21 @@ index de88e509994226daf6ac41ff91fb547b013682cd..f2e6645d47b6a955f3dcd4334c038314
      gfx_vulkan_backend.finish();
      vk_pipeline_shutdown();
      vk_exec_draw_shutdown();
+diff --git a/runtime/vk_device.c b/runtime/vk_device.c
+index 078a455a51414eb632022a25704e2e863e2e6576..c8f260363acb7910a4269292eb2cd50bb1eab37a 100644
+--- a/runtime/vk_device.c
++++ b/runtime/vk_device.c
+@@ -65,8 +65,8 @@ static int create_instance(void) {
+         validate = 0;
+     }
+     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+-    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
+-                             .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
++    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Star Fox Remake Recomp",
++                             .pEngineName = "Star Fox Remake Recomp", .apiVersion = VK_API_VERSION_1_3};
+     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
+                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
+                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
 diff --git a/runtime/vk_exec.c b/runtime/vk_exec.c
 index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2aa476d650 100644
 --- a/runtime/vk_exec.c
@@ -3021,3 +3099,16 @@ index fb70efa6842fa0e3b756041bbe6af75799644c41..5d2ca581140900adc0fb8d2188a052ea
  }
  
  uint64_t vk_texture_last_write(const tex_t *t) {
+diff --git a/tools/build_game.py b/tools/build_game.py
+index 51239d183058fdd9aa8b81641d33503dd8926cb6..ae5ba8561e09b43f1d9632df802b3fa3f705df7e 100644
+--- a/tools/build_game.py
++++ b/tools/build_game.py
+@@ -78,7 +78,7 @@ ROOT = Path(__file__).resolve().parent.parent
+ # them. MAIN_ROOT is where they land, so resolved paths still print and compare relative to a root.
+ MAIN_ROOT = (ROOT / 'build').resolve().parent
+ UCRT = Path(r'C:\msys64\ucrt64\bin')
+-EXE = 'ocarina.exe' if WIN else 'ocarina'
++EXE = 'starfox.exe' if WIN else 'starfox'
+ 
+ 
+ def on_path(name):

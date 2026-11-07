@@ -30,12 +30,12 @@ $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
 $env:TOTK_INPUT = 'none'
 $env:TOTK_AUDIO = 'none'
 $env:TOTK_TRACE = 'gfx,present,fs,ipc'
-& .\build\phase1-base\ocarina.exe --probe-nvn-boot --profile .\build\phase3-validation-profile *> .\build\phase3-nvn.log
+& .\build\phase1-base\starfox.exe --probe-nvn-boot --profile .\build\phase3-validation-profile *> .\build\phase3-nvn.log
 $bootExit = $LASTEXITCODE
 Get-Content .\build\phase3-nvn.log -Tail 5
 $bootExit
 ```
 
-A sonda escolhe o backend nulo e só retorna sucesso após os checkpoints. `TOTK_TRACE` registra os nomes consultados, as leituras do arquivo, a abertura das conexões locais e as apresentações. Para testar os objetos e efeitos NVN isoladamente, execute `ocarina.exe --probe-nvn`.
+A sonda escolhe o backend nulo e só retorna sucesso após os checkpoints. `TOTK_TRACE` registra os nomes consultados, as leituras do arquivo, a abertura das conexões locais e as apresentações. Para testar os objetos e efeitos NVN isoladamente, execute `starfox.exe --probe-nvn`.
 
 Na compilação verificada, `--selftest`, `--boot` e `--probe-nvn` também passaram. A sonda NVN isolada cobriu 975 verificações, entre elas a fence gravada e 48 tipos de comandos. As apresentações da Fase 3 contabilizam o caminho do jogo até a fila. O primeiro quadro com imagem e a validação do caminho Vulkan continuam na Fase 4.
