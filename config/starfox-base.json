@@ -1,0 +1,14 @@
+{
+  "title_id": "0400E88025B1A000",
+  "revision_raw": "0x0",
+  "exefs_sha256": {
+    "main": "3d7f02f7d2acc37b8c1e871b69ef185350700cc70d07865f585647998569e5dc",
+    "main.npdm": "6d8d1cbe1b25e824de749c70061789a03ace5027dadea155de8b23a60ba02db6",
+    "rtld": "87c39fd59d4d6a763b63ec39e1fab3662f084e49e0b12aad235ff85b8a866772",
+    "sdk": "f306d21b0507dce55bd5c8c9a9fa48ffbf11f3cdc246c9fe78079895241546c9",
+    "subsdk0": "ab06fd16da9921d25a2196276ad523b510607625e257c03f7b5a4a7ca2b33c4c",
+    "subsdk1": "409ed2912dda8737a3dd9753c2d34c16544dff7c863b36e2647b66f5eb337f49",
+    "subsdk2": "517e7eb922bbe312740b9e4af4eab01aeeec6d5b230b5fa9ef28fcd897ed18d8",
+    "subsdk3": "164f09d5abfc3a31df47e2665087aabbf704943286806d1a5b685de675a22cd8"
+  }
+}

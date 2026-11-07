@@ -1,0 +1,2 @@
+zstandard==0.25.0
+nup @ git+https://github.com/a55uka/nup.git@a4840f06c94ddeb414eea5b33c9704ffe995f11c#subdirectory=tools/nup

@@ -1,0 +1,614 @@
+diff --git a/runtime/boot.c b/runtime/boot.c
+index 25f3432e088c7e4dfb631097c8f509b499bf0501..a2a7e7099f7e33572c06df2cdd773d7d15a52fa7 100644
+--- a/runtime/boot.c
++++ b/runtime/boot.c
+@@ -3,7 +3,8 @@
+ // da35b83 (MIT, Copyright (c) 2026 Peiikai).
+ // The boot driver: the guest main thread runs the game's own nn::init::Start
+ // with three host callbacks, the second of which runs DT_INIT of main, subsdk0 and sdk; Start then calls nnMain.
+-// --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call, at the return address of
++// Star Fox --boot checks the VZIP header read and ends at the first nvnBootstrapLoader call.
++// TotK --boot checks two checkpoints on the way and ends at the first nvnBootstrapLoader call, at the return address of
+ // each in main (1.1.1, 1.2.1, 1.4.3):
+ //   SetFocusHandlingMode   main+0xeb8c14 (1.2.1: +0xe7a954, 1.4.3: +0xbdb48c) in nnMain, every module's constructor
+ //                          flag reads 2
+@@ -15,6 +16,7 @@
+ #include <string.h>
+ 
+ #include "cfg.h"
++#include "dispatch.h"
+ #include "fs.h"
+ #include "gfx.h"
+ #include "nvn_api.h"
+@@ -38,6 +40,7 @@ static const InitCount inits_143[] = {{"main", 10717}, {"subsdk0", 45}, {"sdk",
+ #define expected_inits (RT_V143 ? inits_143 : RT_V111 ? inits_111 : inits_121)
+ 
+ static volatile int32_t inits_done, checkpoint_seen;
++static volatile int32_t archive_seen, first_nvn_seen, boot_finished;
+ uint64_t rt_guest_start_ns;
+ 
+ static const RtLoaded *module_named(const char *name) {
+@@ -93,6 +96,13 @@ static void cb_module_inits(Cpu *c) {
+         if (!m->init) rt_fatal("boot: %s has no DT_INIT", m->name);
+         rt_log("boot: ENTER %s DT_INIT (%llu init_array entries)", m->name, (unsigned long long)entries);
+         rt_call(c, m->init, 0);
++        if (m->deferred_tlsdesc) {
++            uint64_t resolver = LD64(m->deferred_tlsdesc);
++            const RtLoaded *sdk = module_named("sdk");
++            if (resolver - sdk->base >= sdk->text_end || !rt_dispatch_lookup(resolver))
++                rt_fatal("boot: %s DT_INIT did not install a callable SDK TLS resolver", m->name);
++            rt_log("boot: %s TLSDESC initialized by guest SDK", m->name);
++        }
+         uint32_t state = ctor_state(m);
+         rt_logf("boot: DT_INIT %s state=%u (%llu)\n", m->name, state, (unsigned long long)entries);
+         if (state != CTOR_DONE) rt_fatal("boot: %s DT_INIT left its constructor flag at %u, not 2", m->name, state);
+@@ -115,9 +125,35 @@ static void stats_line(void) {
+            (unsigned long long)s.threads, (unsigned long long)s.host_calls);
+ }
+ 
++static void finish_starfox_boot(void) {
++    if (!rt_config()->boot || rt_config()->seconds || plat_cas32(&archive_seen, 0, 0) != 1 ||
++        !plat_cas32(&first_nvn_seen, 0, 0) || plat_xchg32(&boot_finished, 1)) return;
++    stats_line();
++    fflush(stdout);
++    fflush(stderr);
++    plat_exit(0);
++}
++
++void rt_boot_archive_read(uint64_t bytes) {
++    if (!plat_cas32(&archive_seen, -1, 0)) {
++        rt_log("boot: VZIP data.zip header read at offset 0 (%llu bytes)", (unsigned long long)bytes);
++        plat_xchg32(&archive_seen, 1);
++        finish_starfox_boot();
++    }
++}
++
+ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
+-    if (!rt_game_version) return;   // the expected call sites are TotK's main; Bananza has none pinned
+     char at[128];
++    if (!rt_game_version) {
++        if (!strcmp(what, "nvn")) {
++            if (!plat_cas32(&inits_done, 0, 0)) rt_fatal("boot: first NVN call before module constructors");
++            rt_log("boot: first NVN call nvnBootstrapLoader(\"%s\") from %s", detail, caller(c, at, sizeof at));
++            if (strcmp(detail, "nvnDeviceGetProcAddress")) rt_fatal("boot: unexpected first NVN procedure");
++            plat_xchg32(&first_nvn_seen, 1);
++            finish_starfox_boot();
++        }
++        return;
++    }
+     const RtLoaded *main_mod = module_named("main");
+     uint64_t ret = c->x[30];
+     caller(c, at, sizeof at);
+diff --git a/runtime/fs_host.c b/runtime/fs_host.c
+index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628e50d692e 100644
+--- a/runtime/fs_host.c
++++ b/runtime/fs_host.c
+@@ -634,6 +634,13 @@ static int component_ok(const char *c, size_t n) {
+     return 1;
+ }
+ 
++static const Mount *mount_named(const char *name, size_t len) {  // under lock
++    for (int i = 0; i < NMOUNTS; i++)
++        if (mounts[i].kind && strlen(mounts[i].name) == len && !strncmp(mounts[i].name, name, len))
++            return &mounts[i];
++    return NULL;
++}
++
+ // "name:/a/b" -> host path; 0 on success; *kind = the mount's kind (M_SAVE ...) when kind is given.
+ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kind) {
+     if (!path) return FS_R_INVALID_PATH;
+@@ -643,11 +650,11 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
+     char root[1024];
+     int k = M_FREE;
+     plat_mutex_lock_shared(&lock);
+-    for (int i = 0; i < NMOUNTS; i++)
+-        if (mounts[i].kind && strlen(mounts[i].name) == n && !strncmp(mounts[i].name, path, n)) {
+-            strcpy(root, mounts[i].root);
+-            k = mounts[i].kind;
+-        }
++    const Mount *mount = mount_named(path, n);
++    if (mount) {
++        strcpy(root, mount->root);
++        k = mount->kind;
++    }
+     plat_mutex_unlock_shared(&lock);
+     if (k == M_FREE) return FS_R_PATH_NOT_FOUND;
+     if (kind) *kind = k;
+@@ -1118,6 +1125,32 @@ static void ov_open_file(Cpu *c) { ret_x(c, open_file(arg_p(c, 0), arg_p(c, 1),
+ static void ov_file_size(Cpu *c) { ret_x(c, file_size(arg_p(c, 0), arg_x(c, 1))); }
+ static void ov_close_file(Cpu *c) { close_file(arg_x(c, 0)); }
+ static void ov_entry_type(Cpu *c) { ret_x(c, entry_type(arg_p(c, 0), arg_p(c, 1))); }
++
++// nnmusl checks the mount table and the limits before fopen can call OpenFile.
++static void ov_is_path_mounted(Cpu *c) {
++    const char *path = arg_p(c, 0);
++    const char *colon = path ? strchr(path, ':') : NULL;
++    int mounted = romfs_owns(path);
++    if (!mounted && colon) {
++        plat_mutex_lock_shared(&lock);
++        mounted = mount_named(path, (size_t)(colon - path)) != NULL;
++        plat_mutex_unlock_shared(&lock);
++    }
++    ret_x(c, mounted);
++}
++
++static void ov_path_limit(Cpu *c) {
++    uint64_t *out = arg_p(c, 0);
++    if (out) *out = 0x300;
++    ret_x(c, out ? 0 : FS_R_INVALID_ARGUMENT);
++}
++
++static void ov_utf16_path_limit(Cpu *c) {
++    uint8_t *limited = arg_p(c, 0);
++    uint64_t *out = arg_p(c, 1);
++    if (limited && out) { *limited = 0; *out = 0x300; }
++    ret_x(c, limited && out ? 0 : FS_R_INVALID_ARGUMENT);
++}
+ static void ov_read_file(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
+ static void ov_read_options(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
+ static void ov_read_exact(Cpu *c) { ret_x(c, read_exact(arg_x(c, 0), I64(1), arg_p(c, 2), arg_x(c, 3))); }
+@@ -1207,6 +1240,11 @@ HOST_OVERRIDE(S_OPEN_FILE, ov_open_file);
+ HOST_OVERRIDE(S_FILE_SIZE, ov_file_size);
+ HOST_OVERRIDE(S_CLOSE_FILE, ov_close_file);
+ HOST_OVERRIDE(S_ENTRY_TYPE, ov_entry_type);
++HOST_OVERRIDE("_ZN2nn2fs13IsPathMountedEPKc", ov_is_path_mounted);
++HOST_OVERRIDE("_ZN2nn2fs16GetPathLengthMaxEPmPKc", ov_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs21GetEntryNameLengthMaxEPmPKc", ov_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs21GetUtf16PathLengthMaxEPbPmPKc", ov_utf16_path_limit);
++HOST_OVERRIDE("_ZN2nn2fs26GetUtf16EntryNameLengthMaxEPbPmPKc", ov_utf16_path_limit);
+ HOST_OVERRIDE(S_READ_FILE, ov_read_file);
+ HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
+ HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
+diff --git a/runtime/host.h b/runtime/host.h
+index 24f425d1882b0eaf51d4bc24806183274bf2bc6e..cf8a5dd1ca2eb2ed475dfe3b68d2eea898c92e06 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -73,12 +73,12 @@ void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if
+ 
+ // ---- guest address map (fixed part)
+ #define RT_ADDRESS_LIMIT (1ull << 39)
+-#define RT_KERNEL_BASE 0x7010000000ull
++// Star Fox's six modules occupy more than the original 256 MiB window.
++#define RT_KERNEL_BASE 0x7020000000ull
+ #define RT_KERNEL_SIZE 0x10000000ull
+-#define RT_HOSTFN_BASE 0x7020000000ull
+-// The game's application/program id (main.npdm ACI0): Donkey Kong Bananza. GetInfo 18 returns it and save data is
+-// kept for it alone.
+-#define RT_APPLICATION_ID 0x040074a01bf12000ull
++#define RT_HOSTFN_BASE (RT_KERNEL_BASE + RT_KERNEL_SIZE)
++// Star Fox base, from the ACI0 program ID in the verified main.npdm.
++#define RT_APPLICATION_ID 0x0400e88025b1a000ull
+ #define RT_HOSTFN_SIZE 0x100000ull
+ 
+ // ---- AAPCS64 argument access for host functions (section 2.2)
+@@ -130,7 +130,7 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...);         // host -> guest, sec
+                                                            // as uint64_t: cast every argument. Seals the dispatch
+                                                            // table on first use. Sets x30 = RT_RET_HOST, restores
+                                                            // x30 and pc, returns x0. Does not touch sp
+-#define RT_RET_HOST 0x70200ff000ull                        // x30 sentinel inside the host-function window; a jump to
++#define RT_RET_HOST (RT_HOSTFN_BASE + 0xff000ull)           // x30 sentinel inside the host-function window; a jump to
+                                                            // it is a named fatal
+ 
+ // ---- guest memory (memory.c)
+@@ -175,6 +175,7 @@ void mem_kernel_free(void *p, uint64_t size);              // TLR/TLS reuse afte
+ typedef struct {
+     const char *name; uint64_t base, size, text_end, data_off;   // text_end, data_off: offsets from base
+     uint64_t init, init_array, init_array_size, ctor_flag;  // absolute guest addresses; init_array_size in bytes
++    uint64_t deferred_tlsdesc;                           // descriptor initialized by the guest SDK's DT_INIT
+ } RtLoaded;
+ void ldr_load(const char *exefs_dir);                      // load, relocate (overrides applied), seal; once
+ int ldr_count(void);
+@@ -298,6 +299,7 @@ typedef struct { const char *exefs, *romfs, *profile; int boot; double seconds;
+                                                            // PATH; gpu: TOTK_GPU
+ const RtConfig *rt_config(void);
+ void rt_boot_event(const char *what, Cpu *c, const char *detail);   // checkpoint log; "nvn" ends --boot
++void rt_boot_archive_read(uint64_t bytes);                    // Star Fox's original reader read the VZIP signature
+ void rt_boot(void);                                        // boot.c
+ // Modes of totk.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
+ // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
+diff --git a/runtime/ipc.c b/runtime/ipc.c
+index 21f811c4ea6ee92be5c5f4ca3b45e7bdce5c4919..a510d58f4cc4a19e5c87d2f63b2f7e371c06b773 100644
+--- a/runtime/ipc.c
++++ b/runtime/ipc.c
+@@ -22,10 +22,42 @@
+ enum { T_CLOSE = 2, T_REQUEST = 4, T_CONTROL = 5, T_REQUEST_CTX = 6, T_CONTROL_CTX = 7, T_TIPC_CLOSE = 15,
+        T_TIPC_BASE = 16 };
+ 
++static void bsd_offline_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
++    static int32_t registered;
++    const uint64_t client = 1;  // The host has one guest process.
++    switch (rq->cmd) {
++    case 0: // RegisterClient
++        plat_xchg32(&registered, 1);
++        IPC_OUT(rs, client);
++        return;
++    case 36: { // Switch 2 registration returns a 32-bit BSD status.
++        if (!rq->has_pid || rq->data_size != 16) ipc_unimplemented(s, rq);
++        const uint32_t status = 0;
++        plat_xchg32(&registered, 1);
++        IPC_OUT(rs, status);
++        return;
++    }
++    case 1: { // StartMonitoring (the Switch 2 client passes zero).
++        uint64_t id = IPC_ARG(rq, uint64_t, 0);
++        if (!plat_cas32(&registered, 0, 0) || (id != 0 && id != client))
++            rs->result = IPC_R_BAD_HANDLE;
++        return;
++    }
++    case 2: case 3: { // Socket / SocketExempt, with the network unavailable in the offline profile.
++        const int32_t result[2] = {-1, 100}; // Guest ENETDOWN
++        IPC_OUT(rs, result);
++        return;
++    }
++    default: ipc_unimplemented(s, rq);
++    }
++}
++
+ // Services sm: hands out. Anything else is a named fatal.
+ static const struct { const char *name; IpcHandler handler; } services[] = {
+     {"audren:u", audren_manager_handler},
+     {"aud:u", aud_user_handler},   // Switch 2: the way the SDK reaches audren:u
++    {"bsd:s", bsd_offline_handler},
++    {"bsd:u", bsd_offline_handler},
+ };
+ 
+ static volatile int32_t g_live;
+@@ -39,7 +71,7 @@ uint64_t ipc_sessions_released(void) { return (uint64_t)plat_cas64(&g_released,
+ uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state)) {
+     IpcSession *s = calloc(1, sizeof *s);
+     if (!s) rt_fatal("ipc: session allocation");
+-    *s = (IpcSession){name, handler, state, close, 1};
++    *s = (IpcSession){.name = name, .handler = handler, .state = state, .close = close, .refs = 1};
+     plat_inc32(&g_live);
+     return kern_handle_new(KERN_SESSION, s);
+ }
+@@ -166,7 +198,7 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
+     if ((const uint8_t *)recv - (const uint8_t *)m > IPC_MSG_BYTES) rt_fatal("ipc: request exceeds the message buffer");
+ }
+ 
+-static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
++static void respond(uint32_t *m, int tipc, int domain, const IpcResponse *rs) {
+     uint32_t out[IPC_MSG_BYTES / 4];
+     memset(out, 0, sizeof out);
+     unsigned special = rs->ncopy || rs->nmove;
+@@ -185,6 +217,7 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+     uint8_t *words = (uint8_t *)p, *payload;
+     unsigned header = tipc ? 4 : 16;
+     payload = tipc ? words : (uint8_t *)out + (((words - (uint8_t *)out) + 15) & ~15);
++    if (domain) payload += 16;   // Domain response header, zero output objects.
+     unsigned used = (unsigned)(payload - words) + header + rs->data_size;
+     unsigned nwords = tipc ? (used + 3) / 4 : (used + 16 + 3) / 4;   // CMIF keeps alignment slack like libnx
+     if ((size_t)(words - (uint8_t *)out) + nwords * 4 > IPC_MSG_BYTES) rt_fatal("ipc: response exceeds the message buffer");
+@@ -199,15 +232,22 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+     memcpy(m, out, IPC_MSG_BYTES);
+ }
+ 
+-// CMIF control requests. Domains are not implemented: MNG boots 1.2.1 without them.
++// The offline BSD service uses a single root CMIF domain object.
+ static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+     switch (rq->cmd) {
++    case 0:
++        if (s->handler == bsd_offline_handler && plat_cas32(&s->domain, 1, 0) == 0) {
++            const uint32_t id = 1;
++            IPC_OUT(rs, id);
++            return;
++        }
++        break;
+     case 3: { uint16_t n = POINTER_BUFFER_SIZE; IPC_OUT(rs, n); return; }   // QueryPointerBufferSize
+     case 2: case 4: rs->move[rs->nmove++] = session_clone(s); return;          // CloneCurrentObject(Ex)
+-    default:
+-        ipc_backtrace();
+-        rt_fatal("ipc: %s control command %u is not implemented (domains are not served)", s->name, rq->cmd);
++    default: break;
+     }
++    ipc_backtrace();
++    rt_fatal("ipc: %s control command %u is not implemented", s->name, rq->cmd);
+ }
+ 
+ static void dispatch(IpcSession *s, uint32_t *m) {
+@@ -220,6 +260,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+     IpcResponse rs;
+     memset(&rs, 0, sizeof rs);
+     int tipc = rq.type >= T_TIPC_BASE;
++    int domain = 0;
+     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
+     if (tipc) {
+         rq.cmd = rq.type - T_TIPC_BASE;
+@@ -228,10 +269,30 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+     } else if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX || rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) {
+         const uint8_t *payload = (const uint8_t *)m + (((bytes - (const uint8_t *)m) + 15) & ~15);
+         uint32_t h[4];
++        if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX) {
++            int state = plat_cas32(&s->domain, 0, 0);
++            if (state < 0) rt_fatal("ipc: %s domain is closed", s->name);
++            if (state) {
++                if (end - payload < 16) rt_fatal("ipc: truncated %s domain header", s->name);
++                memcpy(h, payload, 16);
++                if (h[1] != 1 || (h[0] & 0xff00)) rt_fatal("ipc: %s unknown domain object", s->name);
++                if ((h[0] & 0xff) == 2) {
++                    plat_xchg32(&s->domain, -1);
++                    return;
++                }
++                unsigned size = h[0] >> 16;
++                payload += 16;
++                if ((h[0] & 0xff) != 1 || size < 16 || end - payload < size)
++                    rt_fatal("ipc: %s invalid domain payload", s->name);
++                end = payload + size;
++                domain = 1;
++            }
++        }
++        if (end - payload < 16) rt_fatal("ipc: truncated %s CMIF header", s->name);
+         memcpy(h, payload, 16);
+         if (h[0] != CMIF_IN_MAGIC) {
+             ipc_backtrace();
+-            rt_fatal("ipc: %s: CMIF magic %#x (domain sessions are not served)", s->name, h[0]);
++            rt_fatal("ipc: %s: CMIF magic %#x", s->name, h[0]);
+         }
+         rq.cmd = h[2];
+         rq.data = payload + 16;
+@@ -252,7 +313,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
+                tipc ? "tipc" : rq.type == T_CONTROL || rq.type == T_CONTROL_CTX ? "control" : "cmd", rq.cmd,
+                rs.result, rs.ncopy, rs.nmove, t_req ? ldr_describe(t_req->x[30], d, sizeof d) : "host");
+     }
+-    respond(m, tipc, &rs);
++    respond(m, tipc, domain, &rs);
+ }
+ 
+ // ---- sm: service manager (CMIF, and TIPC as the SDK's sm client speaks it since 12.0.0)
+diff --git a/runtime/ipc.h b/runtime/ipc.h
+index 83e07965215781c4b30d917451bc1c9d91cd8b80..feb6a681b17894de7ba61a7f613dea2d3785a4ac 100644
+--- a/runtime/ipc.h
++++ b/runtime/ipc.h
+@@ -47,6 +47,7 @@ struct IpcSession {
+     void *state;
+     void (*close)(void *state);
+     int32_t refs;
++    int32_t domain;  // 0: session, 1: root domain object, -1: root closed
+ };
+ 
+ uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state));   // handle
+diff --git a/runtime/loader.c b/runtime/loader.c
+index 8e7aecd7ac23355e515022bac668197df6e36edd..d9494d1d11a8898bcb9eee022b6afb3bc3a8a6b6 100644
+--- a/runtime/loader.c
++++ b/runtime/loader.c
+@@ -20,7 +20,7 @@ uint64_t hostfn_register_observer(const char *name, GuestFn fn, uint64_t origina
+ enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
+        DT_INIT = 12, DT_FINI = 13, DT_JMPREL = 23, DT_INIT_ARRAY = 25, DT_FINI_ARRAY = 26, DT_INIT_ARRAYSZ = 27,
+        DT_FINI_ARRAYSZ = 28, DT_RELRSZ = 0x23, DT_RELR = 0x24, DT_GNU_HASH = 0x6ffffef5 };
+-enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027 };
++enum { R_ABS64 = 257, R_GLOB_DAT = 1025, R_JUMP_SLOT = 1026, R_RELATIVE = 1027, R_TLSDESC = 1031 };
+ enum { K_RELATIVE, K_ABS64, K_GLOB_DAT, K_JUMP_SLOT, K_COUNT };
+ enum { STB_WEAK = 2, STT_FUNC = 2 };
+ 
+@@ -356,6 +356,16 @@ static void relocate_table(Mod *m, const Elf64Rela *r, uint64_t n) {
+         if (r[i].off < m->pub.data_off || r[i].off > m->pub.size - 8)
+             rt_fatal("loader: %s relocation %llu writes +%#llx, outside the data segment", m->pub.name,
+                      (unsigned long long)i, (unsigned long long)r[i].off);
++        if (type == R_TLSDESC && !strcmp(m->pub.name, "subsdk2") && r[i].off == 0x962698 && !si && !r[i].addend) {
++            // The verified Star Fox SDK handles this local TLS descriptor in __nnmusl_init_dso.
++            // Keep both words in their original state until that code registers the DSO's TLS template.
++            uint64_t address = base + r[i].off;
++            if (m->pub.deferred_tlsdesc || r[i].off > m->pub.size - 16 || LD64(address) || LD64(address + 8))
++                rt_fatal("loader: unexpected Star Fox TLS descriptor state");
++            m->pub.deferred_tlsdesc = address;
++            rt_log("loader: %s +%#llx TLSDESC deferred to guest DT_INIT", m->pub.name, (unsigned long long)r[i].off);
++            continue;
++        }
+         uint64_t v;
+         if (type == R_RELATIVE) {
+             m->kinds[K_RELATIVE]++;
+diff --git a/runtime/memory.c b/runtime/memory.c
+index 27ac13d2775a12b745cd3e5f0135b73a43761ced..20a58e7a3d828bf32b42b0e4daa98e5c7286a486 100644
+--- a/runtime/memory.c
++++ b/runtime/memory.c
+@@ -328,6 +328,12 @@ static int module_data(uint64_t a, uint64_t n) {
+     return off >= m->data_off && n <= m->size - off ? i : -1;
+ }
+ 
++static int stack_source_overlaps(uint64_t a, uint64_t n) {   // under lock
++    for (unsigned i = 0; i < nstack_maps; i++)
++        if (overlaps(a, n, stack_maps[i].src, stack_maps[i].size)) return 1;
++    return 0;
++}
++
+ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
+     if (a & (PAGE - 1)) return R_INVALID_ADDRESS;
+     if (!n || (n & (PAGE - 1))) return R_INVALID_SIZE;
+@@ -336,6 +342,10 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
+     if (i < 0) return R_INVALID_STATE;
+     const RtLoaded *m = ldr_module(i);
+     plat_mutex_lock(&lock);
++    if (stack_source_overlaps(a, n)) {
++        plat_mutex_unlock(&lock);
++        return R_INVALID_STATE;
++    }
+     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
+     for (uint64_t p = 0; p < n / PAGE; p++)
+         if (t[p] & ATTR_PERMISSION_LOCKED) {
+@@ -359,14 +369,18 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
+     if (i < 0) return R_INVALID_STATE;
+     const RtLoaded *m = ldr_module(i);
+     plat_mutex_lock(&lock);
++    if (stack_source_overlaps(a, n)) {
++        plat_mutex_unlock(&lock);
++        return R_INVALID_STATE;
++    }
+     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
+     for (uint64_t p = 0; p < n / PAGE; p++) t[p] |= ATTR_PERMISSION_LOCKED;
+     plat_mutex_unlock(&lock);
+     return R_OK;
+ }
+ 
+-// ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap or alias into the stack region by copy; the
+-// source is inaccessible while moved and gets the contents back on unmap.
++// ---- 0x04/0x05 MapMemory, UnmapMemory: thread stacks move from heap, alias or writable module data by copy.
++// The source is inaccessible while moved and gets the contents back on unmap.
+ static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
+     uint64_t first = (a - L.alias.base) / PAGE;
+     for (uint64_t i = 0; i < n / PAGE; i++)
+@@ -377,12 +391,12 @@ static int alias_all_mapped(uint64_t a, uint64_t n) {   // under lock
+ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
+     if (!n || ((dst | src | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
+     if (!inside(dst, n, L.stack)) return R_INVALID_REGION;
+-    int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
+     int in_alias = inside(src, n, L.alias);
+-    if (!in_heap && !in_alias) return R_INVALID_REGION;
++    int mod = module_data(src, n);
+     plat_mutex_lock(&lock);
+     uint32_t r = R_OK;
+-    if (in_alias && !alias_all_mapped(src, n)) {
++    int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
++    if ((!in_heap && !in_alias && mod < 0) || (in_alias && !alias_all_mapped(src, n))) {
+         r = R_INVALID_REGION;
+         goto out;
+     }
+@@ -399,6 +413,15 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
+         decommit(dst, n, "moved stack");
+         stack_maps[found] = stack_maps[--nstack_maps];
+     } else {
++        if (mod >= 0) {
++            uint64_t off = src - ldr_module(mod)->base;
++            for (uint64_t p = 0; p < n; p += PAGE) {
++                if (module_page_perm(mod, off + p) != PERM_RW) {
++                    r = R_INVALID_STATE;
++                    goto out;
++                }
++            }
++        }
+         if (nstack_maps == MAX_STACK_MAPS) {
+             r = R_INVALID_STATE;
+             goto out;
+@@ -559,7 +582,7 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
+         r.state = ST_CODE;
+         r.perm = PERM_RX;
+     }
+-    // Moved stacks: the destination is Stack, the source Normal without access; free and normal regions around them
++    // Moved stacks: the destination is Stack, the source keeps its state without access; adjacent regions
+     // are clipped (MNG services.c).
+     for (unsigned i = 0; i < nstack_maps; i++) {
+         const StackMap *m = &stack_maps[i];
+@@ -569,11 +592,11 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
+             break;
+         }
+         if (a >= m->src && a < send) {
+-            r = (RtMemoryInfo){.base = m->src, .size = m->size, .state = ST_NORMAL, .perm = PERM_NONE, .attr = 4};
++            r = (RtMemoryInfo){.base = m->src, .size = m->size, .state = r.state, .perm = PERM_NONE, .attr = 4};
+             break;
+         }
+         uint64_t lo = r.base, hi = r.base + r.size;
+-        uint64_t b = r.state == ST_FREE ? m->dst : r.state == ST_NORMAL ? m->src : 0;
++        uint64_t b = r.state == ST_FREE ? m->dst : (r.state == ST_NORMAL || r.state == ST_CODEDATA) ? m->src : 0;
+         uint64_t e = b + m->size;
+         if (!b) continue;
+         if (e <= a && e > lo) lo = e;
+diff --git a/runtime/ov_input.c b/runtime/ov_input.c
+index 1f31deff567911be2b46881721c443a4ccc630b7..243e987d444b86eee899a4897ce9e01f83afb1a5 100644
+--- a/runtime/ov_input.c
++++ b/runtime/ov_input.c
+@@ -512,6 +512,21 @@ HOST_OVERRIDE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS
+ HOST_OVERRIDE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", ov_vib_init);
+ HOST_OVERRIDE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", ov_vib_info);
+ HOST_OVERRIDE("_ZN2nn3hid21InitializeTouchScreenEv", ov_touch_init);
++
++// Joy-Con 2 mouse sensor: the host has no JCMS device, so its ring contains no samples.
++static void ov_jcms_idle(Cpu *c) { (void)c; }
++static void ov_jcms_states(Cpu *c) { ret_x(c, 0); }
++static void ov_jcms_handle(Cpu *c) {
++    const uint32_t *id = need_id(c, 0, "GetJcmsHandle");
++    const uint32_t *type = need_id(c, 1, "GetJcmsHandle");
++    ret_x(c, (*id & 0xff) | (*type & 0xff) << 8);
++}
++HOST_OVERRIDE("_ZN2nn3hid14InitializeJcmsEPvm", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid12FinalizeJcmsEv", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", ov_jcms_idle);
++HOST_OVERRIDE("_ZN2nn3hid13GetJcmsStatesEPNS0_9JcmsStateEiRKNS0_10JcmsHandleE", ov_jcms_states);
++HOST_OVERRIDE("_ZN2nn3hid13GetJcmsHandleERKjRKNS0_8JcmsTypeE", ov_jcms_handle);
+ HOST_OVERRIDE("_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE", ov_touch_state1);
+ HOST_OVERRIDE("_ZN2nn3hid28SetNpadJoyAssignmentModeDualERKj", ov_joy_assignment);
+ HOST_OVERRIDE("_ZN2nn3hid30SetNpadJoyAssignmentModeSingleERKjNS0_17NpadJoyDeviceTypeE", ov_joy_assignment);
+diff --git a/runtime/ov_system.c b/runtime/ov_system.c
+index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..8450f23247f6f5dabf68031149110ee988453ef6 100644
+--- a/runtime/ov_system.c
++++ b/runtime/ov_system.c
+@@ -121,6 +121,25 @@ static void ov_desired_language(Cpu *c) {
+ 
+ static void ov_oe_initialize(Cpu *c) { (void)c; rt_log("oe: application environment: a local host process"); }
+ 
++// Stable per-profile application UUID, without a console identity or a network service.
++static void ov_pseudo_device_id(Cpu *c) {
++    void *out = arg_p(c, 0);
++    if (!out) rt_fatal("nn::oe::GetPseudoDeviceId: null output");
++    uint64_t seed[3] = {0, 0, RT_APPLICATION_ID};
++    uint8_t hash[32];
++    account_uid(seed);
++    rt_sha256(seed, sizeof seed, hash);
++    hash[6] = (hash[6] & 0x0f) | 0x80;
++    hash[8] = (hash[8] & 0x3f) | 0x80;
++    memcpy(out, hash, 16);
++    ret_x(c, 0);
++}
++
++// This profile contains only statically linked modules; nnMain handles an absent optional NRR.
++static void ov_ro_initialize(Cpu *c) { (void)c; rt_log("ro: static modules only"); }
++static void ov_ro_finalize(Cpu *c) { (void)c; }
++static void ov_ro_dynamic(Cpu *c) { (void)c; rt_fatal("ro: dynamic module registration is unavailable"); }
++
+ // void SetPerformanceConfiguration(PerformanceMode mode, int config)
+ static void ov_performance_config(Cpu *c) {
+     int64_t mode = (int32_t)arg_x(c, 0);
+@@ -808,16 +827,25 @@ static void ov_graphics_scale(Cpu *c) { ret_x(c, 2); }
+ static void ov_graphics_scale_notify(Cpu *c) { (void)c; }
+ // void nn::oe::SetAlbumImageOrientation(album::ImageOrientation): there is no capture album
+ static void ov_album_orientation(Cpu *c) { (void)c; }
++// The host does not publish system album capture notifications.
++static void ov_album_notify(Cpu *c) { (void)c; }
+ // void nn::oe::{Enter,Leave}ExitRequestHandlingSection(): no exit request ever arrives from a host system applet
+ static void ov_exit_section(Cpu *c) { (void)c; }
+ 
+ HOST_OVERRIDE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", ov_graphics_scale);
+ HOST_OVERRIDE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", ov_graphics_scale_notify);
+ HOST_OVERRIDE("_ZN2nn2oe24SetAlbumImageOrientationENS_5album16ImageOrientationE", ov_album_orientation);
++HOST_OVERRIDE("_ZN2nn2oe33EnableAlbumImageTakenNotificationEv", ov_album_notify);
++HOST_OVERRIDE("_ZN2nn2oe34DisableAlbumImageTakenNotificationEv", ov_album_notify);
+ HOST_OVERRIDE("_ZN2nn2oe31EnterExitRequestHandlingSectionEv", ov_exit_section);
+ HOST_OVERRIDE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", ov_exit_section);
+ 
+ HOST_OVERRIDE("_ZN2nn2oe10InitializeEv", ov_oe_initialize);
++HOST_OVERRIDE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", ov_pseudo_device_id);
++HOST_OVERRIDE("_ZN2nn2ro10InitializeEv", ov_ro_initialize);
++HOST_OVERRIDE("_ZN2nn2ro8FinalizeEv", ov_ro_finalize);
++HOST_OVERRIDE("_ZN2nn2ro18RegisterModuleInfoEPNS0_16RegistrationInfoEPKv", ov_ro_dynamic);
++HOST_OVERRIDE("_ZN2nn2ro20UnregisterModuleInfoEPNS0_16RegistrationInfoE", ov_ro_dynamic);
+ HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
+ HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
+ HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);
+diff --git a/runtime/romfs.c b/runtime/romfs.c
+index b30e20e1c5457cd107e4a7f9838286723db27312..d9ddc28aa6b86e291e0a9f1f63a75cd46c479004 100644
+--- a/runtime/romfs.c
++++ b/runtime/romfs.c
+@@ -658,6 +658,11 @@ uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uin
+         done += (uint64_t)r;
+     }
+     *out = done;
++    if (rt_config()->boot && !offset && done >= 4 && f == image && base == 0 && file_count &&
++        !strcmp(entry_name(entry(0)), "data.zip")) {
++        if (memcmp(buffer, "VZIP", 4)) rt_fatal("boot: data.zip has no VZIP signature");
++        rt_boot_archive_read(done);
++    }
+     return 0;
+ }
+ 
+diff --git a/runtime/svc.c b/runtime/svc.c
+index acd8a67c088c38d9919e1a3bc0aa44b09d0f7ca1..2909fce818bc789b5fe8b303c204329d7da2efdd 100644
+--- a/runtime/svc.c
++++ b/runtime/svc.c
+@@ -218,6 +218,8 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
+                    // profile saved, logs flushed, exit code 0
+         char at[160];
+         rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
++        if (!rt_game_version && rt_config()->boot && !rt_config()->seconds)
++            rt_fatal("boot: guest exited before the VZIP and NVN checkpoints");
+         fs_save_flush();
+         vk_pipeline_save();
+         prof_write();
