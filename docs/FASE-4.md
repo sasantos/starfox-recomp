@@ -49,3 +49,16 @@ A investigação dos frames 1, 600 e 3150 mostrou que os computes `8x8x8` do boo
 A regressão foi coberta em `--probe-vkcopy-astc`: depois de uma escrita por storage, uma geração antiga de escrita do guest não pode causar outro upload. O teste falhava com `owned 0, uploads 1 -> 2` antes da correção e passa após ela. A sequência da missão terminou sem erros de validação, shaders falhos ou draws perdidos. A tela inicial e as nuvens foram comparadas com a referência; as transmissões posteriores ainda exigem investigação de exposição e iluminação.
 
 A apresentação real também foi verificada separadamente do dump. O `totk.ini` local tinha um preset customizado que clareava novamente a imagem corrigida. O preset foi restaurado para `default`, com brilho `0`, contraste e saturação `100` e gamma `1`, corrigindo a tela inicial. Esses ajustes não resolvem o escurecimento excessivo observado em algumas cenas posteriores.
+
+## Correção do volume de luz (compute NVN 2)
+
+O escurecimento das cenas internas vinha, em parte, do compute que monta o volume 3D de luz (`88x50x50 rgba16f`, dispatch `22x13x13`, frames 872 a 1042 da sequência do cockpit). A imagem que ele escreve e as três texturas de sombra que ele lê caíam em descritores dummy. Assim, o shader de iluminação seguinte lia um volume antigo, e o feixe volumétrico da plataforma não aparecia.
+
+O banco c0 do NVN 2 tem duas tabelas que o runtime não conhecia, entre as texturas e as imagens: texturas separadas (controle `+0xb4`) e samplers separados (`+0xb5`). Nesse compute, as contagens são 13 uniform buffers, 4 texturas em `0xe0`, 32 texturas separadas em `0x100`, 13 samplers em `0x200` e 5 imagens em `0x268`. O tamanho do banco informado pelo driver em `+0xba` (`0x290`) bate com essa ordem nos 11 computes registrados. Sem as duas tabelas, o handle da imagem (`0x288`, slot 4) ficava fora da faixa. O tradutor, além disso, declarava essa imagem como `R8G8B8A8Unorm`.
+
+- `nvn2_lower.cpp` copia `+0xb4/+0xb5` para o bloco DKC1 (`+20`) e confere o total contra `+0xba`.
+- `nvn2_c0.h` inclui as tabelas no layout (partes 6 e 7). Sem elas, o layout continua idêntico ao anterior.
+- O pedido ao tradutor ganha o campo opcional `c0_separate`, enviado só quando não é zero. Por isso as chaves de cache dos demais shaders não mudam. O tradutor (`tools/xlate/Program.cs`) usa o campo para tipos e formatos, devolve-o no `.res.json` e o `--probe-nvn2-c0` cobre o layout do Star Fox.
+- `gfx_shader.c` mapeia as texturas separadas para o slot vinculado e o sampler (metade alta do handle) para o slot de sampler correspondente.
+
+Com o tradutor `29fba628df735893`, o dump do frame 950 mostra a imagem de saída em `t346 88x50x50 rgba16f`, as sombras `8192x8192 d16` e `8192x4096 d32f` vinculadas e nenhum descritor dummy no frame. A cena passa a mostrar o feixe azul da referência do Lichii. As três grades de luz `r32ui` lidas por esse passe continuam zeradas; ainda falta descobrir se a cena não tem luzes locais ou se o compute anterior não as escreve.

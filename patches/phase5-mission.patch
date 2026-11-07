@@ -257,7 +257,7 @@ index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628
  HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
  HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
 diff --git a/runtime/gfx_shader.c b/runtime/gfx_shader.c
-index ec779b1b8549f76dde8f071a4ae31ceda46d7876..225d77da929f9bd9848ce4e0d2d8dab092f2ce63 100644
+index ec779b1b8549f76dde8f071a4ae31ceda46d7876..ebdfffcb0eb477e2bff9ca554f6897060b4b3fcf 100644
 --- a/runtime/gfx_shader.c
 +++ b/runtime/gfx_shader.c
 @@ -869,11 +869,25 @@ static int fmt_code(const char *name) {
@@ -289,7 +289,7 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..225d77da929f9bd9848ce4e0d2d8dab0
  }
  
  static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
-@@ -904,12 +918,13 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
+@@ -904,16 +918,29 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
      r->type = (uint16_t)json_int(o, e, "type", 0);
      r->format = (uint8_t)fmt_code(buf);
      r->flags = (uint8_t)json_int(o, e, "flags", 0);
@@ -306,6 +306,55 @@ index ec779b1b8549f76dde8f071a4ae31ceda46d7876..225d77da929f9bd9848ce4e0d2d8dab0
      if (s->has_c0 && (r->cbuf_slot <= 0 || r->cbuf_slot == 2)) {   // NVN 2 compute: packed-bank handles, 8 bytes each
          int bytes = (handle & 0x3fff) * 4, at = (int)nvn2_c0_part(&s->c0, kind == GFX_RES_IMG ? 4 : 3);
          int n = kind == GFX_RES_IMG ? s->c0.images : s->c0.textures;
+         r->slot = (int16_t)(bytes >= at && bytes < at + 8 * n && (bytes - at) % 8 == 0 ? (bytes - at) / 8 : -1);
++        if (kind == GFX_RES_TEX) r->handle = 0;
++        if (kind == GFX_RES_TEX && r->slot < 0 && (s->c0.sep_textures || s->c0.sep_samplers)) {
++            // A separate texture: its handle in the low 14 bits, its sampler's in the next 14 (either order). The
++            // texture's index is its slot in the bound textures, the sampler's (+1) its slot in the bound samplers.
++            int st = (int)nvn2_c0_part(&s->c0, 6), ss = (int)nvn2_c0_part(&s->c0, 7);
++            int nt = s->c0.sep_textures, ns = s->c0.sep_samplers;
++            for (int half = 0; half < 2; half++) {
++                int b = (handle >> (14 * half) & 0x3fff) * 4;
++                if (b >= st && b < st + 8 * nt && (b - st) % 8 == 0) r->slot = (int16_t)((b - st) / 8);
++                else if (b >= ss && b < ss + 8 * ns && (b - ss) % 8 == 0) r->handle = (uint16_t)((b - ss) / 8 + 1);
++            }
++        }
+     }
+ }
+ 
+@@ -1135,6 +1162,23 @@ static int reflect(GfxShader *s, int flags) {
+                 if (*q++ != (i + 1 == n ? ']' : ',')) return 0;
+             }
+         }
++        // Optional [separate textures, separate samplers]: tables between the texture and the image handles
++        const char *sep = json_member(js, end, "c0_separate");
++        if (sep == end) return 0;
++        if (sep) {
++            if (*sep != '[') return 0;
++            char *q = (char *)sep + 1;
++            uint8_t *d = &s->c0.sep_textures;
++            for (int i = 0; i < 2; i++) {
++                while (isspace((unsigned char)*q)) q++;
++                if (!isdigit((unsigned char)*q)) return 0;
++                unsigned long v = strtoul(q, &q, 10);
++                if (v > 128) return 0;
++                d[i] = (uint8_t)v;
++                while (isspace((unsigned char)*q)) q++;
++                if (*q++ != (i ? ']' : ',')) return 0;
++            }
++        }
+         if (!nvn2_c0_valid(&s->c0, NVN2_C0_BYTES)) return 0;
+         s->has_c0 = 1;
+     }
+@@ -1556,6 +1600,8 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const
+                          GFX_STORAGE_CANDIDATES_VERSION, lay[4], lay[5], lay[6], lay[7]);
+             for (int i = 0; i < NVN2_ROOT_TABLES; i++) o += sprintf(o, "%s%u", i ? "," : "", lay[12 + i]);
+             o += sprintf(o, "]");
++            // separate texture and sampler tables (nvn2_lower.cpp, +20): only when present, so other keys stay the same
++            if (lay[20] | lay[21]) o += sprintf(o, ",\"c0_separate\":[%u,%u]", lay[20], lay[21]);
+         }
+     }
+     /* Control byte +0x718 of a fragment shader: early fragment tests (the NVN driver's early-Z-force, MacNativeGames
 diff --git a/runtime/gfx_window_sdl.c b/runtime/gfx_window_sdl.c
 index b1978c6155eba19e3811f0b25912c71b3eb2d9f9..c2c753f58a252301d6cb2415a679d55bf25bd218 100644
 --- a/runtime/gfx_window_sdl.c
@@ -992,6 +1041,73 @@ index 27ac13d2775a12b745cd3e5f0135b73a43761ced..20a58e7a3d828bf32b42b0e4daa98e5c
          uint64_t e = b + m->size;
          if (!b) continue;
          if (e <= a && e > lo) lo = e;
+diff --git a/runtime/nvn2_c0.h b/runtime/nvn2_c0.h
+index 109c32b0bf161ef5829183b2f2161e9c99150bae..8928801370566827dc50a08f7a2d9b45090b3637 100644
+--- a/runtime/nvn2_c0.h
++++ b/runtime/nvn2_c0.h
+@@ -12,10 +12,13 @@
+ 
+ typedef struct {
+     uint8_t images, ubos, ssbos, textures;
++    uint8_t sep_textures, sep_samplers;   // control +0xb4/+0xb5: separate texture and sampler handles ("c0_separate")
+     uint8_t roots[NVN2_ROOT_TABLES];   // declared words, each table padded to four words in c0
+ } Nvn2C0Layout;
+ 
+-// Parts: 0 roots, 1 uniform buffers, 2 storage buffers, 3 texture handles, 4 image handles, 5 end.
++// Parts: 0 roots, 1 uniform buffers, 2 storage buffers, 3 texture handles, 4 image handles, 5 end, 6 separate texture
++// handles, 7 separate sampler handles. The separate tables sit between the texture and the image handles (control +0xba,
++// the driver's bank size, confirms the order), so with no separate handles parts 4 and 5 are those of version 2.
+ static inline size_t nvn2_c0_part(const Nvn2C0Layout *l, unsigned part) {
+     size_t at = 0x10;
+     if (!part) return at;
+@@ -26,11 +29,16 @@ static inline size_t nvn2_c0_part(const Nvn2C0Layout *l, unsigned part) {
+     at += 16u * l->ssbos;
+     if (part == 3) return at;
+     at += 8u * l->textures;
++    if (part == 6) return at;
++    at += 8u * l->sep_textures;
++    if (part == 7) return at;
++    at += 8u * l->sep_samplers;
+     return part == 4 ? at : at + 8u * l->images;
+ }
+ 
+ static inline int nvn2_c0_valid(const Nvn2C0Layout *l, size_t capacity) {
+-    if (l->ubos > 16 || l->ssbos > 16 || l->images > 32 || l->textures > 128) return 0;
++    if (l->ubos > 16 || l->ssbos > 16 || l->images > 32 || l->textures > 128 || l->sep_textures > 128 ||
++        l->sep_samplers > 128) return 0;
+     for (unsigned i = 0; i < NVN2_ROOT_TABLES; i++) if (l->roots[i] > NVN2_ROOT_WORDS) return 0;
+     return nvn2_c0_part(l, 5) <= capacity;
+ }
+diff --git a/runtime/nvn2_lower.cpp b/runtime/nvn2_lower.cpp
+index 5ec4eda92ff1a4a21bc7667ecd559897aabaa633..c122704f7c837cbec0126c79e80c968845f90d94 100644
+--- a/runtime/nvn2_lower.cpp
++++ b/runtime/nvn2_lower.cpp
+@@ -170,10 +170,22 @@ Lowered *lower(const uint8_t *control, const uint8_t *code) {
+     if (!gfx) {
+         std::memcpy(out->control.data() + 0x748, control + 0x58, 12);   // local size (NVN 2 control +0x58)
+         // The compute driver bank is packed per program from these counts (gfx_shader.c, "NVN 2 compute c0"):
+-        // images +0xb6, uniform buffers +0xb1, storage buffers +0xb2, textures +0xb3.
+-        // DKC1 adds the eight root-table word counts. The marker and counts enter the code/cache hash, so an older
+-        // DKC0 translation cannot be reused with the new parameter-block layout.
++        // images +0xb6, uniform buffers +0xb1, storage buffers +0xb2, textures +0xb3, then separate textures +0xb4 and
++        // separate samplers +0xb5, whose handle tables sit between the texture and image tables (Star Fox's light-volume
++        // compute: 4 textures at 0xe0, 32 separate textures at 0x100, 13 samplers at 0x200, 5 images at 0x268).
++        // DKC1 adds the eight root-table word counts and, at +20, the two separate counts. The marker and counts enter
++        // the code/cache hash, so an older DKC0 translation cannot be reused with the new parameter-block layout.
+         const uint8_t lay[8] = {'D', 'K', 'C', '1', control[0xb6], control[0xb1], control[0xb2], control[0xb3]};
++        {   // +0xba: the driver's bank size, a check on the table order above
++            uint32_t at = 0x10;
++            for (int i = 0; i < 8; i++) at += ((control[0xa9 + i] + 3u) & ~3u) * 4u;
++            at += 16u * (control[0xb1] + control[0xb2]) + 8u * (control[0xb3] + control[0xb4] + control[0xb5] + control[0xb6]);
++            uint16_t size;
++            std::memcpy(&size, control + 0xba, 2);
++            if (size && size != at)
++                rt_log("nvn2: compute bank of %#x bytes, the table counts give %#x: handle slots may be wrong", size, at);
++        }
++        std::memcpy(out->control.data() + kC0Layout + 20, control + 0xb4, 2);
+         std::memcpy(out->control.data() + kC0Layout, lay, sizeof lay);
+         // Shared memory bytes (NVN 2 control +0x64; Bananza's upscaling network uses 0x2a88): the translator sizes the
+         // workgroup's shared array from it, and with 0 every LDS read back nothing.
 diff --git a/runtime/nvn_api.h b/runtime/nvn_api.h
 index 20285bc6248a670d6f9d3f96ba49fd0cc29f0dc9..bca65c57d6aadefcf03fff2d3b8437397ca6bb32 100644
 --- a/runtime/nvn_api.h
@@ -3112,3 +3228,96 @@ index 51239d183058fdd9aa8b81641d33503dd8926cb6..ae5ba8561e09b43f1d9632df802b3fa3
  
  
  def on_path(name):
+diff --git a/tools/xlate/Program.cs b/tools/xlate/Program.cs
+index 519a2898d0861aca6ef5f348cdcf4655761e8890..e3988659363fd980507ade0a957a6291b7d9eef4 100644
+--- a/tools/xlate/Program.cs
++++ b/tools/xlate/Program.cs
+@@ -35,6 +35,7 @@ static class SwshXlate
+         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
+         readonly byte[] _c1;
+         readonly int _rootBytes;
++        readonly int _sepTextures, _sepSamplers;   // "c0_separate": separate texture and sampler handles between textures and images
+         public int StorageCandidatesVersion { get; }
+         public int GeometryVersion { get; }
+         public string GeometryInputName { get; }
+@@ -97,7 +98,7 @@ static class SwshXlate
+                     if (name != "triangles" || GeometryOutputName != "triangle_strip" ||
+                         (BitConverter.ToUInt32(code, 8) >> 24) != 1 || (BitConverter.ToUInt32(code, 16) & 0xfff) != 1)
+                         throw new NotSupportedException("Portable passthrough requires triangles, triangle strip, one invocation and raw maximum vertex count 1");
+-                    if (job.ContainsKey("c0") || job.ContainsKey("c0_version") || job.ContainsKey("c0_roots"))
++                    if (job.ContainsKey("c0") || job.ContainsKey("c0_version") || job.ContainsKey("c0_roots") || job.ContainsKey("c0_separate"))
+                         throw new InvalidDataException("Portable passthrough does not accept a compute driver layout");
+                     if (job["gs_passthrough_skip"] is not JsonArray skip || skip.Count != 8)
+                         throw new InvalidDataException("Portable passthrough requires exactly eight uint32 skip words");
+@@ -143,11 +144,24 @@ static class SwshXlate
+                     if (words < 0 || words > 64) throw new InvalidDataException("NVN 2 root table exceeds 64 words");
+                     _rootBytes += ((words + 3) & ~3) * 4;
+                 }
++                // Optional [separate textures, separate samplers] (NVN 2 control +0xb4/+0xb5): their handle tables sit
++                // between the texture and the image handles.
++                if (job["c0_separate"] != null)
++                {
++                    if (job["c0_separate"] is not JsonArray sep || sep.Count != 2 || (int)sep[0] < 0 || (int)sep[0] > 128 ||
++                        (int)sep[1] < 0 || (int)sep[1] > 128)
++                        throw new InvalidDataException("NVN 2 c0_separate must be [textures, samplers], each 0..128");
++                    _sepTextures = (int)sep[0];
++                    _sepSamplers = (int)sep[1];
++                }
+                 if ((int)counts[0] < 0 || (int)counts[0] > 32 || (int)counts[1] < 0 || (int)counts[1] > 16 ||
+                     (int)counts[2] < 0 || (int)counts[2] > 16 || (int)counts[3] < 0 || (int)counts[3] > 128 ||
+-                    16 + _rootBytes + 16 * ((int)counts[1] + (int)counts[2]) + 8 * ((int)counts[0] + (int)counts[3]) > 0x800)
++                    16 + _rootBytes + 16 * ((int)counts[1] + (int)counts[2]) +
++                    8 * ((int)counts[0] + (int)counts[3] + _sepTextures + _sepSamplers) > 0x800)
+                     throw new InvalidDataException("NVN 2 compute parameter block exceeds the host layout");
+             }
++            else if (job["c0_separate"] != null)
++                throw new InvalidDataException("c0_separate requires an NVN 2 compute layout");
+         }
+         // c1 常数段（着色器包控制段前 0x100 字节）：间接跳转 BRX 的跳转表在这里（LDC c[1]）；不提供时翻译器解不出跳转目标、控制流出错（粒子着色器死循环）
+         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
+@@ -172,10 +186,14 @@ static class SwshXlate
+             // "c0": [images, uniform buffers, storage buffers, textures] of an NVN 2 compute bank (the host's gfx_shader.c,
+             // NVN2_C0_LAYOUT): a 16-byte head, separately padded root tables, uniform/storage tables, texture and
+             // image handles. Root counts are independent of the number of images. Texture/image handles are 8 bytes.
++            // Separate texture handles (c0_separate) follow the textures, then separate samplers, then the images; a
++            // separate texture's slot is its index, as the host binds it.
+             if (_job["c0"] is JsonArray c && c.Count == 4)
+             {
+-                int tex = 0x10 + _rootBytes + 16 * ((int)c[1] + (int)c[2]), img = tex + 8 * (int)c[3];
+-                if (bytes >= tex && bytes < img && (bytes - tex) % 8 == 0) return (bytes - tex) / 8;
++                int tex = 0x10 + _rootBytes + 16 * ((int)c[1] + (int)c[2]), sep = tex + 8 * (int)c[3];
++                int img = sep + 8 * (_sepTextures + _sepSamplers);
++                if (bytes >= tex && bytes < sep && (bytes - tex) % 8 == 0) return (bytes - tex) / 8;
++                if (bytes >= sep && bytes < sep + 8 * _sepTextures && (bytes - sep) % 8 == 0) return (bytes - sep) / 8;
+                 if (bytes >= img && bytes < img + 8 * (int)c[0] && (bytes - img) % 8 == 0) return (bytes - img) / 8;
+                 return -1;
+             }
+@@ -329,6 +347,7 @@ static class SwshXlate
+                     res["c0"] = c0.DeepClone();
+                     res["c0_version"] = 2;
+                     res["c0_roots"] = job["c0_roots"].DeepClone();
++                    if (job["c0_separate"] is JsonNode sep) res["c0_separate"] = sep.DeepClone();
+                 }
+                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                 return null;
+@@ -353,6 +372,20 @@ static class SwshXlate
+         Check(new Accessor(Array.Empty<byte>(), job).QuerySamplerType(0x70 / 4, 0) == SamplerType.Texture3D);
+         job["c0_roots"] = new JsonArray(0, 0, 0, 0, 0, 0, 0, 0);
+         Check(new Accessor(Array.Empty<byte>(), job).QuerySamplerType(0x40 / 4, 0) == SamplerType.Texture3D);
++        // Star Fox's light-volume compute: 13 uniform buffers, 4 textures at 0xe0, 32 separate textures at 0x100,
++        // 13 samplers at 0x200 and 5 images at 0x268 (control +0xba gives 0x290 bytes).
++        JsonObject sf = JsonNode.Parse("""
++            {"c0_version":2,"c0":[5,13,0,4],"c0_roots":[0,0,0,0,0,0,0,0],"c0_separate":[32,13],
++             "tex":{"0":"3d","22":"2d_depth"},"img":{"4":{"type":"3d","fmt":"R16G16B16A16Float"}}}
++            """).AsObject();
++        var s = new Accessor(Array.Empty<byte>(), sf);
++        Check(s.QuerySamplerType(0xe0 / 4, 0) == SamplerType.Texture3D);
++        Check(s.QuerySamplerType(0x1b0 / 4, 0) == SamplerType.Texture2D);
++        Check(s.QueryTextureFormat(0x288 / 4, 0) == TextureFormat.R16G16B16A16Float);
++        sf["c0_separate"] = new JsonArray(32);
++        bool sepRejected = false;
++        try { _ = new Accessor(Array.Empty<byte>(), sf); } catch (InvalidDataException) { sepRejected = true; }
++        Check(sepRejected);
+         job.Remove("c0_version");
+         bool rejected = false;
+         try { _ = new Accessor(Array.Empty<byte>(), job); } catch (InvalidDataException) { rejected = true; }
