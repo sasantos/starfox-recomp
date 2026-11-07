@@ -39,3 +39,13 @@ $bootExit
 A execução registrará a criação do dispositivo Vulkan, a tradução dos shaders, o início do loop gráfico com múltiplos dispatches de compute e renderização, gravando o frame no destino especificado.
 
 Com a validação dos shaders e do backend Vulkan concluída, o projeto avança para a **Fase 5 · Primeira missão jogável**, integrando entrada de controle, áudio Wwise/Opus, reprodução de vídeo e progressão de jogo.
+
+## Correção da fidelidade das LUTs
+
+A investigação dos frames 1, 600 e 3150 mostrou que os computes `8x8x8` do boot geram corretamente as LUTs 3D `64³` usadas pelo color grading. Uma escrita posterior das páginas antigas da CPU podia, porém, reenviar zeros por cima desses dados. O fallback de LUT identidade tornava a cena acinzentada e removia detalhes; a referência executada no Lichii confirmou as cores e o enquadramento esperados.
+
+`vk_texture_storage_bound_locked` agora trata o binding de storage como uma escrita potencial e compartilha com renders/cópias a marcação de conteúdo GPU-owned em `vk_texture.c`. Assim, a imagem produzida pela GPU não é substituída por uma versão antiga do storage. O fallback inicial de identidade continua existindo, mas não substitui mais a LUT gerada durante o boot.
+
+A regressão foi coberta em `--probe-vkcopy-astc`: depois de uma escrita por storage, uma geração antiga de escrita do guest não pode causar outro upload. O teste falhava com `owned 0, uploads 1 -> 2` antes da correção e passa após ela. A sequência da missão terminou sem erros de validação, shaders falhos ou draws perdidos. A tela inicial e as nuvens foram comparadas com a referência; as transmissões posteriores ainda exigem investigação de exposição e iluminação.
+
+A apresentação real também foi verificada separadamente do dump. O `totk.ini` local tinha um preset customizado que clareava novamente a imagem corrigida. O preset foi restaurado para `default`, com brilho `0`, contraste e saturação `100` e gamma `1`, corrigindo a tela inicial. Esses ajustes não resolvem o escurecimento excessivo observado em algumas cenas posteriores.

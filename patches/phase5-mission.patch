@@ -256,6 +256,56 @@ index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628
  HOST_OVERRIDE(S_READ_FILE, ov_read_file);
  HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
  HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
+diff --git a/runtime/gfx_shader.c b/runtime/gfx_shader.c
+index ec779b1b8549f76dde8f071a4ae31ceda46d7876..225d77da929f9bd9848ce4e0d2d8dab092f2ce63 100644
+--- a/runtime/gfx_shader.c
++++ b/runtime/gfx_shader.c
+@@ -869,11 +869,25 @@ static int fmt_code(const char *name) {
+ // c2 slot of a texture or image handle (Service.cs of MNG's totk_xlate: combined handles at 0x20, 32 slots; images at
+ // 0x120; separate textures at 0x168), -1 outside those ranges or for a handle in another constant buffer.
+ static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
+-    if (cbuf_slot >= 0 && cbuf_slot != 2) return -1;
++    (void)separate;
++    if (cbuf_slot >= 0 && (cbuf_slot & 0xffff) != 2) return -1;
+     int bytes = (handle & 0x3fff) * 4;
+     if (kind == GFX_RES_IMG) return bytes >= 0x120 && bytes < 0x168 ? (bytes - 0x120) / 8 : -1;
+-    if (separate) return bytes >= 0x168 && bytes < 0x568 ? (bytes - 0x168) / 8 : -1;
+-    return bytes >= 0x20 && bytes < 0x120 ? (bytes - 0x20) / 8 : -1;
++    if (bytes >= 0x168 && bytes < 0x568) return (bytes - 0x168) / 8;
++    if (bytes >= 0x20 && bytes < 0x120) return (bytes - 0x20) / 8;
++    int bytes1 = ((handle >> 14) & 0x3fff) * 4;
++    if (bytes1 >= 0x168 && bytes1 < 0x568) return (bytes1 - 0x168) / 8;
++    if (bytes1 >= 0x20 && bytes1 < 0x120) return (bytes1 - 0x20) / 8;
++    return -1;
++}
++
++static int handle_sampler_slot(int kind, int cbuf_slot, int handle) {
++    if (kind != GFX_RES_TEX || (cbuf_slot >= 0 && (cbuf_slot & 0xffff) != 2)) return 0;
++    int bytes0 = (handle & 0x3fff) * 4;
++    if (bytes0 >= 0x568 && bytes0 < 0x968) return (bytes0 - 0x568) / 8 + 1;
++    int bytes1 = ((handle >> 14) & 0x3fff) * 4;
++    if (bytes1 >= 0x568 && bytes1 < 0x968) return (bytes1 - 0x568) / 8 + 1;
++    return 0;
+ }
+ 
+ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
+@@ -904,12 +918,13 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
+     r->type = (uint16_t)json_int(o, e, "type", 0);
+     r->format = (uint8_t)fmt_code(buf);
+     r->flags = (uint8_t)json_int(o, e, "flags", 0);
+-    r->cbuf_slot = (int8_t)json_int(o, e, "cbuf_slot", -1);
++    int cbuf_slot_raw = (int)json_int(o, e, "cbuf_slot", -1);
++    r->cbuf_slot = (int8_t)cbuf_slot_raw;
+     int handle = (int)json_int(o, e, "handle", 0);
+-    r->handle = (uint16_t)handle;
++    r->handle = (uint16_t)(kind == GFX_RES_TEX ? handle_sampler_slot(kind, cbuf_slot_raw, handle) : handle);
+     r->count = (uint16_t)json_int(o, e, "array", 1);
+     r->separate = sep && *sep == 't';
+-    r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
++    r->slot = (int16_t)handle_slot(kind, cbuf_slot_raw, handle, r->separate);
+     if (s->has_c0 && (r->cbuf_slot <= 0 || r->cbuf_slot == 2)) {   // NVN 2 compute: packed-bank handles, 8 bytes each
+         int bytes = (handle & 0x3fff) * 4, at = (int)nvn2_c0_part(&s->c0, kind == GFX_RES_IMG ? 4 : 3);
+         int n = kind == GFX_RES_IMG ? s->c0.images : s->c0.textures;
 diff --git a/runtime/gfx_window_win.c b/runtime/gfx_window_win.c
 index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..3773c681cca341419ba5e7694a7c4755a07b4e67 100644
 --- a/runtime/gfx_window_win.c
@@ -2604,6 +2654,72 @@ index c92cd68134caf7ca53ab48118a125b969489a3e3..89e813351cb45495f2f5f56498fbd4f9
          case 0x81a: {
              if ((insn.words[2] & ~0x200U) || insn.words[1] > 32 || dest >= 255)
                  return fail(index, "native sign extend mode");
+diff --git a/runtime/vk.h b/runtime/vk.h
+index 4183228a9ba5c1459ebe71e1f55b4a0421ce343f..65405635df857bce2c3a235be1c69d186b67f4ce 100644
+--- a/runtime/vk.h
++++ b/runtime/vk.h
+@@ -354,7 +354,7 @@ uint32_t vk_texture_slots_gen(void);
+ uint64_t vk_texture_slot_token(const dpool_ref *pool, int id);
+ uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
+ void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
+-void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
++void vk_texture_storage_bound_locked(const VkTexImage *img);   // potential storage write; GPU owns the newer image
+ uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
+ size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
+ int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
+diff --git a/runtime/vk_copy_probe.c b/runtime/vk_copy_probe.c
+index de88e509994226daf6ac41ff91fb547b013682cd..f2e6645d47b6a955f3dcd4334c0383149878d7fc 100644
+--- a/runtime/vk_copy_probe.c
++++ b/runtime/vk_copy_probe.c
+@@ -355,6 +355,40 @@ done:
+     return bad;
+ }
+ 
++static int storage_write_ownership(uint8_t *guest) {
++    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest, .size = POOL_BYTES, .game_mem = guest};
++    tex_t texture;
++    memset(&texture, 0, sizeof texture);
++    texture.magic = NVN_TEX_MAGIC;
++    texture.d.target = NVN_TEXTURE_TARGET_2D;
++    texture.d.format = NVN_FORMAT_RGBA8;
++    texture.d.width = texture.d.height = 8;
++    texture.d.depth = texture.d.levels = 1;
++    nvn_tex_layout(&texture.d, &texture.L);
++    texture.pool = &pool, texture.off = TEXTURE_OFFSET, texture.mem = pool.mem + TEXTURE_OFFSET;
++    if (!gfx_vulkan_backend.pool_init(&pool)) return 1;
++    const VkTexImage *image = vk_texture_get(&texture);
++    vk_upload_flush(1);
++    uint32_t before = 0, after = 0;
++    int last_change = 0, pages_written = 0;
++    if (image) vk_texture_debug(image, &before, &last_change, &pages_written);
++    if (image) {
++        vk_texture_lock();
++        vk_texture_storage_bound_locked(image);
++        vk_texture_unlock();
++    }
++    vk_guest_written((uintptr_t)texture.mem, texture.L.size);
++    image = vk_texture_get(&texture);
++    if (image) vk_texture_debug(image, &after, &last_change, &pages_written);
++    int bad = !image || !image->gpu_owned || before != 1 || after != before;
++    if (bad) printf("probe-vkcopy-astc: FAIL storage write: owned %d, uploads %u -> %u after a stale guest write\n",
++                    image ? image->gpu_owned : -1, before, after);
++    else printf("probe-vkcopy-astc: storage write keeps GPU ownership despite a stale guest write\n");
++    gfx_vulkan_backend.texture_release(&texture);
++    gfx_vulkan_backend.pool_fini(&pool);
++    return bad;
++}
++
+ void vk_exec_draw_shutdown(void);
+ void vk_exec_xfer_shutdown(void);
+ 
+@@ -432,6 +466,7 @@ int probe_vkcopy_astc(void) {
+         bad = t2t_case(&gfx_vulkan_backend, (uint8_t *)(uintptr_t)heap, &t2t_cases[i], i, &checks);
+         if (!bad) completed++, skipped += !t2t_cases[i].copied;
+     }
++    if (!bad) bad = storage_write_ownership((uint8_t *)(uintptr_t)heap);
+     gfx_vulkan_backend.finish();
+     vk_pipeline_shutdown();
+     vk_exec_draw_shutdown();
 diff --git a/runtime/vk_exec.c b/runtime/vk_exec.c
 index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2aa476d650 100644
 --- a/runtime/vk_exec.c
@@ -2617,10 +2733,140 @@ index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2a
          case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
              if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
 diff --git a/runtime/vk_exec_draw.c b/runtime/vk_exec_draw.c
-index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669100ba3d0 100644
+index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a4f96bc65e4f6c69a05a9d9e4af693fdbffaef2d 100644
 --- a/runtime/vk_exec_draw.c
 +++ b/runtime/vk_exec_draw.c
-@@ -3599,12 +3599,14 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
+@@ -130,6 +130,10 @@ static struct {
+     int c0_valid[5];
+     struct { p_bind_buf ssbo[16], ubo[16]; uint32_t dim[3], binst; Nvn2C0Layout lay; uint8_t has_lay;
+              uint32_t roots[NVN2_ROOT_TABLES][NVN2_ROOT_WORDS]; } c0_in[5];   // what vk_c0_fill read for c0[k]
++    uint8_t c2[6][0x980];                // last c2 texture/sampler bank per stage
++    VkBuffer c2_buf[6];
++    VkDeviceSize c2_off[6];
++    int c2_valid[6];
+     VkPipelineLayout ds_layout;          // graphics layout the sets below were last pushed or bound with
+     VkDescriptorSet ds_bound[2];         // allocated set bound per set number (0: none or pushed since)
+     VkDescriptorSet ds_last[2];          // last allocated and written set per set number, contents in DS
+@@ -1229,11 +1233,28 @@ static void limits_init(void) {
+     __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
+ }
+ 
++static VkDescriptorBufferInfo c2_info(VkExec *ex, int st) {
++    if (st < 0 || st >= 6) return zero_info(LIM.ubo_max);
++    uint8_t tmp[0x980];
++    memset(tmp, 0, sizeof tmp);
++    memcpy(tmp + 0x020, ex->tex[st], 32 * 8);
++    memcpy(tmp + 0x120, ex->img[st], 8 * 8);
++    memcpy(tmp + 0x168, ex->tex[st], 128 * 8);
++    memcpy(tmp + 0x568, ex->samp[st], 128 * 8);
++    if (!B.c2_valid[st] || memcmp(tmp, B.c2[st], sizeof tmp)) {
++        memcpy(scratch(ex, sizeof tmp, &B.c2_buf[st], &B.c2_off[st]), tmp, sizeof tmp);
++        memcpy(B.c2[st], tmp, sizeof tmp);
++        B.c2_valid[st] = 1;
++    }
++    return (VkDescriptorBufferInfo){B.c2_buf[st], B.c2_off[st], sizeof tmp};
++}
++
+ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
+     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+     uint64_t max = LIM.ubo_max, align = LIM.ubo_align;
+     VkDescriptorBufferInfo bi;
+     if (slot == 0 && c0_on()) return c0_info(ex, st);
++    if (slot == 2) return c2_info(ex, st);
+     if (slot == 1 && ex->prog) {   // compiler constants stored after the shader code
+         const uint8_t *ctl, *code;
+         uint32_t len, c1;
+@@ -2051,6 +2072,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
+                 for (uint32_t k = 0; k < cnt; k++) {
+                     int slot = r->slot + (int)k;
+                     if (slot == 0 && c0_on()) c0 = 1, rs_add(tmp, &n, ex, ex->ssbo[st], sizeof ex->ssbo[st]);
++                    else if (slot == 2) { ok = 0; break; }
+                     else if (slot >= 3 && slot - 3 < 18) rs_add(tmp, &n, ex, &ex->ubo[st][slot - 3], sizeof(p_bind_buf));
+                 }   // slot 1: the program (bind_sig); others: the zero buffer
+             } else if (b->kind == GFX_RES_SSBO) {   // every descriptor of the binding is the same range
+@@ -2071,6 +2093,7 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
+                 for (uint32_t k = 0; k < cnt; k++) {
+                     int slot = r->slot + (int)k;
+                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
++                    if (!img && r->handle > 0 && r->handle <= 128) rs_add(tmp, &n, ex, &ex->samp[st][r->handle - 1], 8);
+                 }
+             }
+         }
+@@ -2243,6 +2266,53 @@ static void bl_scan(VkExec *ex) {
+     static VkImage done_tex[BL_TEX];
+     static VkSampler done_samp[BL_SAMP];
+     static uint8_t seen_tex[BL_TEX], seen_samp[BL_SAMP];
++    static const uint16_t rtype[BL_KINDS] = {2, 0x102, 5, 4, 2 | 0x400, 0x102 | 0x400, 5 | 0x400, 0x105};
++    static uint64_t last_bgen, last_tgen;
++    VkDevice dev = vk_ctx()->device;
++    uint32_t tgen = vk_texture_slots_gen();
++    if (last_bgen != bind_gen || last_tgen != tgen) {
++        last_bgen = bind_gen, last_tgen = tgen;
++        vk_texture_lock();
++        for (int st = 0; st < 6; st++) {
++            for (int i = 0; i < 128; i++) {
++                uint64_t h = ex->tex[st][i];
++                uint32_t tid = (uint32_t)(h & 0xfffff), sid = (uint32_t)(h >> 20 & 0xfff);
++                if (tid && tid < BL_TEX && !(h >> 32)) {
++                    view_t v;
++                    int hv;
++                    const VkTexImage *img = vk_texture_by_id_locked(&ex->tex_pool, (int)tid, &v, &hv);
++                    if (img && done_tex[tid] != img->image) {
++                        done_tex[tid] = img->image;
++                        for (uint32_t k = 0; k < BL_KINDS; k++) {
++                            if (k >= 4 && k < 7 && !(img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) continue;
++                            VkImageView view = get_view(ex, img, &v, hv, rtype[k], 0);
++                            if (!view) continue;
++                            VkDescriptorImageInfo ii = {.imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
++                            VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = bl_set, .dstBinding = k,
++                                                      .dstArrayElement = tid, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
++                                                      .pImageInfo = &ii};
++                            vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
++                        }
++                    }
++                }
++                for (int sp = 0; sp < 2; sp++) {
++                    uint32_t s_id = sp ? (uint32_t)(ex->samp[st][i] >> 20 & 0xfff) : sid;
++                    if (s_id && s_id < BL_SAMP) {
++                        VkSampler s = vk_sampler_by_id_locked(&ex->samp_pool, (int)s_id);
++                        if (s && done_samp[s_id] != s) {
++                            done_samp[s_id] = s;
++                            VkDescriptorImageInfo ii = {.sampler = s};
++                            VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = bl_set, .dstBinding = BL_SAMP_BINDING,
++                                                      .dstArrayElement = s_id, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
++                                                      .pImageInfo = &ii};
++                            vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
++                        }
++                    }
++                }
++            }
++        }
++        vk_texture_unlock();
++    }
+     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+     const p_bind_buf *u = &ex->ssbo[NVN_STAGE_FS][3];
+     if (!u->addr || u->size < 0x100000) return;   // the material table; smaller buffers in this slot hold other data, and resolving their words as handles makes images from stale memory
+@@ -2254,10 +2324,8 @@ static void bl_scan(VkExec *ex) {
+     tables[slot].addr = u->addr, tables[slot].next = frame + 16;
+     memset(seen_tex, 0, sizeof seen_tex);
+     memset(seen_samp, 0, sizeof seen_samp);
+-    static const uint16_t rtype[BL_KINDS] = {2, 0x102, 5, 4, 2 | 0x400, 0x102 | 0x400, 5 | 0x400, 0x105};
+     const uint8_t *p = (const uint8_t *)(uintptr_t)u->addr;
+     int new_tex = 0, new_samp = 0, handles = 0, uniq = 0, misses = 0;
+-    VkDevice dev = vk_ctx()->device;
+     vk_texture_lock();
+     for (uint64_t o = 16; o + 8 <= len; o += 8) {
+         if ((o & 31) != 16 && (o & 31) != 24) continue;
+@@ -2391,6 +2459,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
+                     uint64_t h = 0;
+                     if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
++                    if (!img && h && !(h >> 20) && r->handle > 0 && r->handle <= 128)
++                        h |= ex->samp[st][r->handle - 1];
+                     tex_info(ex, r, h, img, r->separate, &o[k].image);
+                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
+                 }
+@@ -3599,12 +3669,14 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
  // lost the device on an RTX 5090 (an invalid instruction pointer, the same address in every run). Such a giant is replaced
  // (this NVN 2 stage only) by a blit from its largest sampled texture to the image it writes. 1 when it was. ponytail: bilinear, not the game's
  // filter; lower the shader's size instead when that is understood. TOTK_BIG_CS=0 runs it.
@@ -2637,7 +2883,7 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669
      static int on = -1;
      if (on < 0) {
          const char *e = getenv("TOTK_BIG_CS");
-@@ -3612,28 +3614,51 @@ static int big_compute_blit(VkExec *ex, const GfxShader *cs, const VkPipeInfo *i
+@@ -3612,25 +3684,34 @@ static int big_compute_blit(VkExec *ex, const GfxShader *cs, const VkPipeInfo *i
      }
      if (!on) return 0;
      const VkTexImage *src = NULL, *dst = NULL;
@@ -2682,24 +2928,7 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669
                 dst ? dst->width : 0, dst ? dst->height : 0, dst ? (int)dst->format : 0);
      }
      if (!src || !dst) return 1;
-+    if (org != 0xfd029a317a9a4b94ull) {
-+        vk_exec_barrier(ex);
-+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-+                          .srcOffsets = {{0, 0, 0}, {(int32_t)src->width, (int32_t)src->height, 1}},
-+                          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-+                          .dstOffsets = {{0, 0, 0}, {(int32_t)dst->width, (int32_t)dst->height, 1}}};
-+        vkCmdBlitImage(ex->cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-+        ex->recorded++;
-+        vk_texture_lock();
-+        vk_texture_storage_bound_locked(dst);
-+        vk_texture_unlock();
-+        vk_exec_barrier(ex);
-+        return 1;
-+    }
-     vk_exec_barrier(ex);
-     // The tone map stores the square root of the colour as RGB9E5 by hand in an image of format r11g11b10f: its bits go to
-     // an image of the real format first, and a small compute pass squares them on the way to the target.
-@@ -3745,6 +3770,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+@@ -3745,6 +3826,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
          }
          return;
      }
@@ -2707,7 +2936,7 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669
      {   // LOCAL TEST (Ocarina): each compute program's first dispatch, and DKB_SKIP_CS=<hex origin,...> leaves some out
          static uint64_t seen[1024], skip[32];
          static int nseen, nskip, init;
-@@ -3823,7 +3849,6 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
+@@ -3823,7 +3905,6 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
      const VkPipeInfo *info = NULL;
      VkPipeline p = vk_pipeline_compute(cs, &info);
      if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -2715,65 +2944,80 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669
      vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
      bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
      c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
+@@ -4186,6 +4267,8 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
+     case OP_BIND_SAMP: {
+         const p_bind_handles *b = payload;
+         bind_handles(host_stage(b->stage, 3, b->first) >= 0 && host_stage(b->stage, 3, b->first) < 6 ? ex->samp[host_stage(b->stage, 3, b->first)] : NULL, 128, b);
++        ex->tex_serial++;
++        bind_gen++;
+         break;
+     }
+     case OP_BIND_IMG: {
 diff --git a/runtime/vk_texture.c b/runtime/vk_texture.c
-index fb70efa6842fa0e3b756041bbe6af75799644c41..5a9b4bad9ba3c2474c6dbf048f142b98e1e201ce 100644
+index fb70efa6842fa0e3b756041bbe6af75799644c41..5d2ca581140900adc0fb8d2188a052ead47500c9 100644
 --- a/runtime/vk_texture.c
 +++ b/runtime/vk_texture.c
-@@ -632,6 +632,17 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
+@@ -966,6 +966,25 @@ static void wb_cfg_init(void) {
+     if (wb_limit != WB_SMALL_DEFAULT) rt_log("vk: fence write-back limit %llu bytes", (unsigned long long)wb_limit);
  }
  
- // Copies the whole storage into the image (every level and layer the image has).
-+static inline uint16_t lut_float_to_half(float f) {
-+    uint32_t x;
-+    memcpy(&x, &f, 4);
-+    uint32_t sign = (x >> 16) & 0x8000;
-+    int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
-+    uint32_t mant = (x >> 13) & 0x3ff;
-+    if (exp <= 0) return (uint16_t)sign;
-+    if (exp >= 31) return (uint16_t)(sign | 0x7c00);
-+    return (uint16_t)(sign | (exp << 10) | mant);
++static void note_gpu_written(Tex *e) {
++    e->pub.gpu_owned = 1;
++    uint64_t f = vk_exec_recording_fence();
++    if (f > e->wr_fence) e->wr_fence = f;
++    if (e->pub.mirrored) {
++        e->gpu_dirty = 1;
++        storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
++        if (wb_exact < 0) wb_exact = cfg_bool("TOTK_WB_EXACT");
++        if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
++            rt_fatal("vk: out of memory for a texture's storage copy");
++        if (e->snap) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
++        e->gpu_seq = ++gpu_writes;
++        e->gpu_fence = vk_exec_recording_fence();
++        wb_cfg_init();
++        if (e->t.L.size <= wb_limit) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
++        own_add(e);
++    }
 +}
 +
- static void upload(Tex *e) {
-     static volatile int32_t n_bad, n_undecoded;
-     const tex_t *t = &e->t;
-@@ -688,6 +699,39 @@ static void upload(Tex *e) {
-             } else {
-                 rg[k].bufferRowLength = rb / (uint32_t)bpb * (uint32_t)bw, rg[k].bufferImageHeight = rows * (uint32_t)bh;
-             }
-+            if (is3d && e->f.vk == VK_FORMAT_R16G16B16A16_SFLOAT) {
-+                int has_data = 0;
-+                const uint64_t *d64 = (const uint64_t *)dst;
-+                for (size_t wi = 0; wi < raw / 8; wi++) {
-+                    if (d64[wi]) { has_data = 1; break; }
-+                }
-+                if (!has_data) {
-+                    static int logged_lut;
-+                    if (!logged_lut) {
-+                        logged_lut = 1;
-+                        rt_log("vk: 3D LUT at %#llx (%ux%ux%u) is all zeros; replacing with identity LUT",
-+                               (unsigned long long)e->pub.addr, w, h, sl);
-+                    }
-+                    uint16_t *f16 = (uint16_t *)dst;
-+                    for (uint32_t z = 0; z < sl; z++) {
-+                        float fz = sl > 1 ? (float)z / (float)(sl - 1) : 0.0f;
-+                        uint16_t b = lut_float_to_half(fz);
-+                        for (uint32_t y = 0; y < h; y++) {
-+                            float fy = h > 1 ? (float)y / (float)(h - 1) : 0.0f;
-+                            uint16_t g = lut_float_to_half(fy);
-+                            for (uint32_t x = 0; x < w; x++) {
-+                                float fx = w > 1 ? (float)x / (float)(w - 1) : 0.0f;
-+                                uint16_t r = lut_float_to_half(fx);
-+                                size_t idx = ((size_t)z * h * w + (size_t)y * w + x) * 4;
-+                                f16[idx + 0] = r;
-+                                f16[idx + 1] = g;
-+                                f16[idx + 2] = b;
-+                                f16[idx + 3] = 0x3c00;
-+                            }
-+                        }
-+                    }
-+                }
-+            }
-             free(tmp);
-         }
-     uint8_t *raw_copy = acheck ? malloc(total) : NULL;
+ void vk_texture_gpu_written(const tex_t *t) {
+     if (!t || !t->mem) return;
+     vk_exec_frame_written(t);
+@@ -973,22 +992,7 @@ void vk_texture_gpu_written(const tex_t *t) {
+     Tex *e = entry_of(t);
+     if (e) {
+         make_fresh(e);   // a partial render keeps what the storage held before
+-        e->pub.gpu_owned = 1;
+-        uint64_t f = vk_exec_recording_fence();
+-        if (f > e->wr_fence) e->wr_fence = f;
+-        if (e->pub.mirrored) {
+-            e->gpu_dirty = 1;
+-            storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
+-            if (wb_exact < 0) wb_exact = cfg_bool("TOTK_WB_EXACT");
+-            if (wb_exact && !e->snap && e->t.L.size <= SNAP_MAX && fills_no_page(e) && !(e->snap = malloc(SNAP_MAX)))
+-                rt_fatal("vk: out of memory for a texture's storage copy");
+-            if (e->snap) memcpy(e->snap, (const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+-            e->gpu_seq = ++gpu_writes;
+-            e->gpu_fence = vk_exec_recording_fence();
+-            wb_cfg_init();
+-            if (e->t.L.size <= wb_limit) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
+-            own_add(e);
+-        }
++        note_gpu_written(e);
+     }
+     unlock();
+ }
+@@ -1451,11 +1455,9 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
+ }
+ 
+ // A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
+-// tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
++// tex_info). Treat the binding as a potential write: a later upload of older guest bytes must not replace its image.
+ void vk_texture_storage_bound_locked(const VkTexImage *img) {
+-    Tex *e = (Tex *)img;   // pub is the first member
+-    uint64_t f = vk_exec_recording_fence();
+-    if (f > e->wr_fence) e->wr_fence = f;
++    note_gpu_written((Tex *)img);   // pub is the first member
+ }
+ 
+ uint64_t vk_texture_last_write(const tex_t *t) {
