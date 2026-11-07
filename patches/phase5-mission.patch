@@ -28,7 +28,7 @@ index b2469984b9115c831b4f830c347fafc643ebc4b8..e7657b4e76b347b863f855b9f93f7d59
          if op0 == 0b0100 and not (op1 & 2) and (op2 & 7) == 5 and (op3 & 0b110000011) == 0b10:
              return self.crypto_aes(w)
 diff --git a/runtime/boot.c b/runtime/boot.c
-index 25f3432e088c7e4dfb631097c8f509b499bf0501..e3a7676905ffc1265d4295ef372a9e4ec34f85cb 100644
+index 25f3432e088c7e4dfb631097c8f509b499bf0501..6d2be39e2b4fe51a6ba7c286801033f689ffd4c1 100644
 --- a/runtime/boot.c
 +++ b/runtime/boot.c
 @@ -3,7 +3,8 @@
@@ -141,6 +141,15 @@ index 25f3432e088c7e4dfb631097c8f509b499bf0501..e3a7676905ffc1265d4295ef372a9e4e
      const RtLoaded *main_mod = module_named("main");
      uint64_t ret = c->x[30];
      caller(c, at, sizeof at);
+@@ -142,7 +201,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
+             rt_fatal("boot: first NVN call before the SetFocusHandlingMode checkpoint");
+         rt_logf("boot: first NVN call nvnBootstrapLoader(\"%s\") from main+%#llx\n", detail,
+                (unsigned long long)(ret - main_mod->base));
+-        if (rt_config()->seconds) return;   // --seconds: the run goes on into the world
++        if (rt_config()->seconds || !rt_config()->boot) return;   // normal run or --seconds: the run goes on into the world
+         if (rt_trace & RT_TRACE_HOSTCALL) hostfn_report();
+         stats_line();
+         fflush(stdout);
 @@ -303,6 +362,25 @@ static void series_shot(const tex_t *t, uint64_t n) {
  // counted by the back end only.
  void rt_frame_presented(const tex_t *t, uint64_t n) {
@@ -247,6 +256,30 @@ index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628
  HOST_OVERRIDE(S_READ_FILE, ov_read_file);
  HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
  HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
+diff --git a/runtime/gfx_window_win.c b/runtime/gfx_window_win.c
+index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..531e9afda965b6ee751a4802146ce283f38ed3d5 100644
+--- a/runtime/gfx_window_win.c
++++ b/runtime/gfx_window_win.c
+@@ -312,7 +312,7 @@ static void window_main(void *arg) {
+     // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
+     // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
+     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
+-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Ocarina Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
++    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Star Fox (Nintendo Switch 2)", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
+                              NULL, inst, NULL);
+     if (!g_hwnd) {
+         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
+@@ -326,7 +326,9 @@ static void window_main(void *arg) {
+         // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
+         plat_xchg32(&g_dpi, (int32_t)GetDpiForWindow(g_hwnd));
+         outer_size(g_hwnd, cw, ch, &ow, &oh);
+-        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
++        ShowWindow(g_hwnd, SW_SHOWNORMAL);
++        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, ow, oh, SWP_NOMOVE | SWP_SHOWWINDOW);
++        SetForegroundWindow(g_hwnd);
+         if (!background) {
+             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
+             FlashWindowEx(&fw);
 diff --git a/runtime/host.h b/runtime/host.h
 index 24f425d1882b0eaf51d4bc24806183274bf2bc6e..480ec1d3dbf9c66f53f4ca386fe05e8cc8693bb8 100644
 --- a/runtime/host.h
@@ -881,10 +914,43 @@ index 20285bc6248a670d6f9d3f96ba49fd0cc29f0dc9..bca65c57d6aadefcf03fff2d3b843739
  // OP_DRAW_IDX_IND: DrawElementsIndirect; ind = GPU address of {count, instances, first index, base vertex, base
  // instance} (VkDrawIndexedIndirectCommand's layout), read by the GPU when the draw runs
 diff --git a/runtime/nvn_api_cmd.c b/runtime/nvn_api_cmd.c
-index 3b316cbe95d3e99eeb401fb2663a83e235298e55..fed21fe96b47fc90017ea41591153f8067745ee2 100644
+index 3b316cbe95d3e99eeb401fb2663a83e235298e55..7585ded90c54713eda74db30589857b2a4f60cf4 100644
 --- a/runtime/nvn_api_cmd.c
 +++ b/runtime/nvn_api_cmd.c
-@@ -924,6 +924,31 @@ NVN_API(nvnCommandBufferWaitSync) {
+@@ -912,6 +912,32 @@ NVN_API(nvnCommandBufferDownsample) {
+     if (o->dst) o->dr = (NVNcopyRegion){0, 0, 0, (int)o->dst->d.width, (int)o->dst->d.height, 1};
+     o->flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT;
+ }
++void nvn_record_evaluate_dlss(Cpu *c) {
++    cmd_t *cmd = cmd_of(c);
++    const dlss_params_t *p = arg_p(c, 2);
++    if (!cmd || !p) return;
++    const NVNtexture *col = p->tex[DLSS_COLOR];
++    const NVNtexture *out = p->tex[DLSS_OUTPUT];
++    if (!col || !out) return;
++
++    p_copy_t2t *o = REC(cmd, OP_COPY_T2T, p_copy_t2t);
++    o->src = tex_pin(col);
++    o->dst = tex_pin(out);
++    int iw = p->iw > 0 ? p->iw : (o->src ? (int)o->src->d.width : 0);
++    int ih = p->ih > 0 ? p->ih : (o->src ? (int)o->src->d.height : 0);
++    int ow = o->dst ? (int)o->dst->d.width : 0;
++    int oh = o->dst ? (int)o->dst->d.height : 0;
++    o->sr = (NVNcopyRegion){p->base[DLSS_COLOR][0], p->base[DLSS_COLOR][1], 0, iw, ih, 1};
++    o->dr = (NVNcopyRegion){p->base[DLSS_OUTPUT][0], p->base[DLSS_OUTPUT][1], 0, ow, oh, 1};
++    o->flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT;
++
++    static volatile int32_t logged;
++    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
++        rt_log("nvn2: DLSS evaluate: blitting 3D scene %dx%d -> %dx%d (col %p format %#x, out %p format %#x)",
++               iw, ih, ow, oh, (const void *)col, o->src ? o->src->d.format : 0,
++               (const void *)out, o->dst ? o->dst->d.format : 0);
++    }
++}
+ // void nvnCommandBufferSetCopyRowStride(NVNcommandBuffer *cmd, ptrdiff_t stride)
+ NVN_API(nvnCommandBufferSetCopyRowStride) { REC(cmd_of(c), OP_COPY_STRIDE, p_copy_stride)->stride = (int64_t)arg_x(c, 1); }
+ // void nvnCommandBufferSetBlendColor(NVNcommandBuffer *cmd, const float *rgba)
+@@ -924,6 +950,31 @@ NVN_API(nvnCommandBufferWaitSync) {
      REC(o, OP_WAIT_SYNC, p_wait_sync)->sync = arg_p(c, 1);
      hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
  }
@@ -916,7 +982,7 @@ index 3b316cbe95d3e99eeb401fb2663a83e235298e55..fed21fe96b47fc90017ea41591153f80
  // Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
  // scratch memory and the tessellation patch size have no host counterpart the replay needs.
  // void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
-@@ -939,8 +964,7 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
+@@ -939,8 +990,7 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
  // as soon as the submit returns). The result is written into the recording copy.
  static uint64_t def_reads, def_changed, n_clones;
  
@@ -926,7 +992,7 @@ index 3b316cbe95d3e99eeb401fb2663a83e235298e55..fed21fe96b47fc90017ea41591153f80
  // Waiting for their maximum before the whole batch is conservative: it orders CPU completion callbacks as well
  // as GPU work before *any* deferred read or backend snapshot, including those before a wait in another handle.
  static uint64_t wait_target(const uint8_t *p, int depth) {
-@@ -967,12 +991,10 @@ static uint64_t wait_target(const uint8_t *p, int depth) {
+@@ -967,12 +1017,10 @@ static uint64_t wait_target(const uint8_t *p, int depth) {
              if (h.size < 8 + sizeof(p_wait_sync)) rt_fatal("nvn: short WaitSync record at %p", (const void *)p);
              const sync_t *source = ((const p_wait_sync *)(const void *)(p + 8))->sync;
              if (!source) rt_fatal("nvn: CommandBufferWaitSync with a null sync");
@@ -942,7 +1008,7 @@ index 3b316cbe95d3e99eeb401fb2663a83e235298e55..fed21fe96b47fc90017ea41591153f80
          }
          if (value > target) target = value;
          p += h.size;
-@@ -1105,7 +1127,7 @@ const char *nvn_op_name(uint32_t op) {
+@@ -1105,7 +1153,7 @@ const char *nvn_op_name(uint32_t op) {
          "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
          "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
          "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
@@ -1026,6 +1092,166 @@ index ae1b8c8558e5742eaa8d929de2bb40308525cfe3..9142d06ca9037d3e71f76370c20c1a2f
  }
  
  // The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when
+diff --git a/runtime/nvn_api_nvn2.c b/runtime/nvn_api_nvn2.c
+index 575ba7e01e357a90c9eed3b341b005bd08a919b8..8d97934b84ce01782df465ef7f4759f7e8a1a845 100644
+--- a/runtime/nvn_api_nvn2.c
++++ b/runtime/nvn_api_nvn2.c
+@@ -20,6 +20,7 @@ NVN_API(nvnQueueBuilderSetRayTracingMemorySize) { (void)c; }
+ NVN_API(nvnQueueBuilderGetRayTracingMemorySize) { ret_x(c, 0); }
+ // size_t nvnQueueGetTotalRayTracingMemoryUsed(const NVNqueue *q)
+ NVN_API(nvnQueueGetTotalRayTracingMemoryUsed) { ret_x(c, 0); }
++NVN_API(nvnQueueBuilderSetQueuePriority) { (void)c; }
+ 
+ // ---- Device
+ // int nvnDeviceGetFlags(const NVNdevice *d): the flags the device was initialized with
+@@ -142,7 +143,146 @@ NVN2_NOT_RECORDED(nvnCommandBufferMultiDrawMeshTasksIndirectCount)
+ NVN2_NOT_RECORDED(nvnCommandBufferEnableExclusiveScissor)
+ NVN2_NOT_RECORDED(nvnCommandBufferSetExclusiveScissor)
+ NVN2_NOT_RECORDED(nvnCommandBufferSetExclusiveScissors)
+-NVN2_NOT_RECORDED(nvnCommandBufferEvaluateDlss)
++
++// ---- NVN 2 DLSS
++static inline int dlss_ceil_div(int v, int d) { return (v + d - 1) / d; }
++static inline int dlss_factor(int method) { return method == 1 ? 3 : (method == 2 ? 1 : 2); }
++
++NVN_API(nvnDlssNetworkBuilderSetDefaults) {
++    dlss_builder_t *b = arg_p(c, 0);
++    if (b) memset(b, 0, sizeof *b);
++}
++NVN_API(nvnDlssNetworkBuilderSetDevice) { (void)c; }
++NVN_API(nvnDlssNetworkBuilderSetOutputResolution) {
++    dlss_builder_t *b = arg_p(c, 0);
++    if (b) { b->w = (int)arg_x(c, 1); b->h = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssNetworkBuilderSetMethod) {
++    dlss_builder_t *b = arg_p(c, 0);
++    if (b) b->method = (int)arg_x(c, 1);
++}
++NVN_API(nvnDlssNetworkBuilderSetPreset) {
++    dlss_builder_t *b = arg_p(c, 0);
++    if (b) b->preset = (int)arg_x(c, 1);
++}
++NVN_API(nvnDlssNetworkBuilderSetFlags) {
++    dlss_builder_t *b = arg_p(c, 0);
++    if (b) b->flags = (uint32_t)arg_x(c, 1);
++}
++NVN_API(nvnDlssNetworkBuilderSetMaxEvaluationEntries) { (void)c; }
++NVN_API(nvnDlssNetworkBuilderSetTextureIDs) { (void)c; }
++NVN_API(nvnDlssNetworkBuilderSetStorage) { (void)c; }
++NVN_API(nvnDlssNetworkBuilderGetStorageSize) { ret_x(c, 0x1000); }
++NVN_API(nvnDlssNetworkBuilderGetOptimalSettings) {
++    const dlss_builder_t *b = arg_p(c, 0);
++    int *ow = arg_p(c, 1), *oh = arg_p(c, 2);
++    int *maxw = arg_p(c, 3), *maxh = arg_p(c, 4);
++    int *minw = arg_p(c, 5), *minh = arg_p(c, 6);
++    float *sharp = arg_p(c, 7);
++    int f = dlss_factor(b ? b->method : 0);
++    int bw = b ? b->w : 1920, bh = b ? b->h : 1080;
++    int w = dlss_ceil_div(bw, f), h = dlss_ceil_div(bh, f);
++    if (ow) *ow = w;
++    if (oh) *oh = h;
++    if (maxw) *maxw = w;
++    if (maxh) *maxh = h;
++    if (minw) *minw = w;
++    if (minh) *minh = h;
++    if (sharp) *sharp = 0.0f;
++    ret_x(c, 1);
++}
++NVN_API(nvnDlssNetworkBuilderGetDevice) { ret_x(c, 0); }
++NVN_API(nvnDlssNetworkBuilderGetFlags) { const dlss_builder_t *b = arg_p(c, 0); ret_x(c, b ? b->flags : 0); }
++NVN_API(nvnDlssNetworkBuilderGetMaxEvaluationEntries) { ret_x(c, 1); }
++NVN_API(nvnDlssNetworkBuilderGetMemory) { ret_x(c, 0); }
++NVN_API(nvnDlssNetworkBuilderGetMemorySize) { ret_x(c, 0x1000); }
++NVN_API(nvnDlssNetworkBuilderGetMethod) { const dlss_builder_t *b = arg_p(c, 0); ret_x(c, b ? b->method : 0); }
++NVN_API(nvnDlssNetworkBuilderGetOutputResolution) {
++    const dlss_builder_t *b = arg_p(c, 0);
++    int *w = arg_p(c, 1), *h = arg_p(c, 2);
++    if (w && b) *w = b->w;
++    if (h && b) *h = b->h;
++}
++NVN_API(nvnDlssNetworkBuilderGetPreset) { const dlss_builder_t *b = arg_p(c, 0); ret_x(c, b ? b->preset : 0); }
++NVN_API(nvnDlssNetworkInitialize) {
++    dlss_net_t *n = arg_p(c, 0);
++    const dlss_builder_t *b = arg_p(c, 1);
++    if (n && b) *n = *b;
++    rt_log("nvn2: DLSS network initialized: %dx%d, method %d, preset %d, flags %#x",
++           b ? b->w : 0, b ? b->h : 0, b ? b->method : 0, b ? b->preset : 0, b ? b->flags : 0);
++    ret_x(c, 1);
++}
++NVN_API(nvnDlssNetworkFinalize) { (void)c; }
++NVN_API(nvnDlssNetworkResize) {
++    dlss_net_t *n = arg_p(c, 0);
++    if (n) { n->w = (int)arg_x(c, 1); n->h = (int)arg_x(c, 2); }
++    ret_x(c, 1);
++}
++
++NVN_API(nvnDlssParametersSetDefaults) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) {
++        memset(p, 0, sizeof *p);
++        p->pre_exposure = 1.0f;
++        p->mv[0] = p->mv[1] = 1.0f;
++    }
++}
++static void dlss_set_tex_slot(Cpu *c, int k) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) p->tex[k] = arg_p(c, 1);
++}
++NVN_API(nvnDlssParametersSetInputColor) { dlss_set_tex_slot(c, DLSS_COLOR); }
++NVN_API(nvnDlssParametersSetDepth) { dlss_set_tex_slot(c, DLSS_DEPTH); }
++NVN_API(nvnDlssParametersSetMotionVectors) { dlss_set_tex_slot(c, DLSS_MOTION); }
++NVN_API(nvnDlssParametersSetOutputColor) { dlss_set_tex_slot(c, DLSS_OUTPUT); }
++NVN_API(nvnDlssParametersSetBiasCurrentColorMask) { dlss_set_tex_slot(c, DLSS_BIAS); }
++NVN_API(nvnDlssParametersSetExposureTexture) { dlss_set_tex_slot(c, DLSS_EXPOSURE); }
++NVN_API(nvnDlssParametersSetInputSubrectangleSize) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->iw = (int)arg_x(c, 1); p->ih = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetInputColorSubrectangleBase) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->base[DLSS_COLOR][0] = (int)arg_x(c, 1); p->base[DLSS_COLOR][1] = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetDepthSubrectangleBase) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->base[DLSS_DEPTH][0] = (int)arg_x(c, 1); p->base[DLSS_DEPTH][1] = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetMotionVectorSubrectangleBase) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->base[DLSS_MOTION][0] = (int)arg_x(c, 1); p->base[DLSS_MOTION][1] = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetOutputSubrectangleBase) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->base[DLSS_OUTPUT][0] = (int)arg_x(c, 1); p->base[DLSS_OUTPUT][1] = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetBiasCurrentColorSubrectangleBase) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->base[DLSS_BIAS][0] = (int)arg_x(c, 1); p->base[DLSS_BIAS][1] = (int)arg_x(c, 2); }
++}
++NVN_API(nvnDlssParametersSetMotionVectorScale) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->mv[0] = arg_s(c, 0); p->mv[1] = arg_s(c, 1); }
++}
++NVN_API(nvnDlssParametersSetJitterOffset) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) { p->jitter[0] = arg_s(c, 0); p->jitter[1] = arg_s(c, 1); }
++}
++NVN_API(nvnDlssParametersSetPreExposure) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) p->pre_exposure = arg_s(c, 0);
++}
++NVN_API(nvnDlssParametersSetHistoryReset) {
++    dlss_params_t *p = arg_p(c, 0);
++    if (p) p->reset = (uint32_t)arg_x(c, 1) & 0xff;
++}
++NVN_API(nvnDlssParametersSetEvaluationIndex) { (void)c; }
++
++NVN_API(nvnCommandBufferEvaluateDlss) {
++    extern void nvn_record_evaluate_dlss(Cpu *);
++    nvn_record_evaluate_dlss(c);
++}
+ NVN2_NOT_RECORDED(nvnCommandBufferInsertDebugMarkerCompute)
+ NVN2_NOT_RECORDED(nvnCommandBufferInsertDebugMarkerGraphics)
+ NVN2_NOT_RECORDED(nvnCommandBufferPushDebugGroupCompute)
 diff --git a/runtime/nvn_api_obj.c b/runtime/nvn_api_obj.c
 index d688fd56425a77b3f8ec2f010ef08895cd4e310e..330563d208fad88a3e5d676dfd8fe7f42f9814e8 100644
 --- a/runtime/nvn_api_obj.c
@@ -1067,7 +1293,7 @@ index dfa603485e7119aeadfd6a23248eeef97fa56bff..a3f371eddb2f3600da4ac69379cfbca1
  // ---------- window queries
  static const win_builder_t *wb_of(const Cpu *c) { return arg_p(c, 0); }
 diff --git a/runtime/nvn_obj.h b/runtime/nvn_obj.h
-index 95118d2c4b5a019013e845318eddc28516796af0..7d0261eb9fb00edffb3867ae6789e010828faab5 100644
+index 95118d2c4b5a019013e845318eddc28516796af0..6fb1c08fa66fed33dc65664756aad28b98b0adfd 100644
 --- a/runtime/nvn_obj.h
 +++ b/runtime/nvn_obj.h
 @@ -147,7 +147,7 @@ enum {
@@ -1079,6 +1305,25 @@ index 95118d2c4b5a019013e845318eddc28516796af0..7d0261eb9fb00edffb3867ae6789e010
  };
  // Payload (immediately follows op_hdr)
  typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
+@@ -180,3 +180,18 @@ typedef struct { const tex_t *src, *dst; view_t sv, dv; uint8_t has_sv, has_dv;
+ typedef struct { const tex_t *tex; view_t view; uint8_t has_view, is_uint; NVNcopyRegion r; int32_t mask; union { float f[4]; uint32_t u[4]; } c; } p_clear_tex;
+ typedef struct { int64_t stride; } p_copy_stride;
+ typedef struct { float rgba[4]; } p_blend_color;
++
++// NVN 2 DLSS
++enum { DLSS_COLOR, DLSS_DEPTH, DLSS_MOTION, DLSS_OUTPUT, DLSS_BIAS, DLSS_EXPOSURE, DLSS_TEXTURES };
++typedef struct { int32_t w, h, method, preset; uint32_t flags; } dlss_builder_t;
++typedef dlss_builder_t dlss_net_t;
++typedef struct {
++    const NVNtexture *tex[DLSS_TEXTURES];
++    int32_t iw, ih;
++    int32_t base[DLSS_TEXTURES][2];
++    float mv[2];
++    float jitter[2];
++    float pre_exposure;
++    uint32_t reset;
++} dlss_params_t;
++
 diff --git a/runtime/nvn_probe.c b/runtime/nvn_probe.c
 index 88df7289f0c841b529bd99fb145a15e2a6132db2..471acecf3d775b0ca30b6cd0aada62603c0119a7 100644
 --- a/runtime/nvn_probe.c
@@ -1273,24 +1518,53 @@ index cbd8546ff1a503b648fe6aeedd68e2bbdc490b2b..2b3e49bba449ea36c00119dc4225dfc1
  HOST_OVERRIDE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", ov_vsync_event);
  HOST_OVERRIDE("nvnBootstrapLoader", ov_nvn_bootstrap);
 diff --git a/runtime/ov_input.c b/runtime/ov_input.c
-index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497fe3adf1c 100644
+index 1f31deff567911be2b46881721c443a4ccc630b7..2c8f959d7d2aef94a2cb61e3d760895c4692f069 100644
 --- a/runtime/ov_input.c
 +++ b/runtime/ov_input.c
-@@ -69,6 +69,13 @@ static void ov_supported_styles(Cpu *c) {
+@@ -55,10 +55,11 @@ static void ov_supported_ids(Cpu *c) {
+     const uint32_t *ids = arg_p(c, 0);
+     uint64_t n = arg_x(c, 1);
+     if (n > 10 || (!ids && n)) rt_fatal("nn::hid::SetSupportedNpadIdType: invalid id list (%llu ids)", (unsigned long long)n);
+-    int ok = 0;
+-    for (uint64_t i = 0; i < n; i++) ok |= ids[i] == pad_id();
++    for (uint64_t i = 0; i < n; i++) {
++        rt_log("hid: SetSupportedNpadIdType [%llu]: %#x", (unsigned long long)i, ids[i]);
++    }
+     plat_mutex_lock(&lock);
+-    allowed = ok;
++    allowed = 1;
      plat_mutex_unlock(&lock);
  }
  
+@@ -67,39 +68,72 @@ static void ov_supported_styles(Cpu *c) {
+     plat_mutex_lock(&lock);
+     styles = (uint32_t)arg_x(c, 0);
+     plat_mutex_unlock(&lock);
++    rt_log("hid: SetSupportedNpadStyleSet: %#x", styles);
++}
++
 +static void ov_get_supported_styles(Cpu *c) {
 +    plat_mutex_lock_shared(&lock);
 +    uint32_t v = styles;
 +    plat_mutex_unlock_shared(&lock);
 +    ret_x(c, v);
-+}
-+
+ }
+ 
  // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
  static void ov_style_set(Cpu *c) {
      uint32_t id = *need_id(c, 0, "GetNpadStyleSet");
-@@ -78,14 +85,9 @@ static void ov_style_set(Cpu *c) {
+     plat_mutex_lock_shared(&lock);
+-    uint32_t v = enabled && allowed && id == pad_id() ? styles & pad_style() : 0;
++    uint32_t v = 0;
++    if (enabled && (id == pad_id() || id == 0 || id == 0x20)) {
++        v = (styles & pad_style()) ? (styles & pad_style()) : (styles ? styles : pad_style());
++    }
+     plat_mutex_unlock_shared(&lock);
++    static int logged;
++    if (logged < 5) {
++        logged++;
++        rt_log("hid: GetNpadStyleSet(id %#x) -> %#x (styles %#x, pad_style %#x)", id, v, styles, pad_style());
++    }
      ret_x(c, v);
  }
  
@@ -1307,9 +1581,20 @@ index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497
 +    if (!out) rt_fatal("nn::hid: null Npad state output");
      plat_mutex_lock(&lock);
      NpadState s = {.sampling = ++sample};
-     int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
-@@ -95,11 +97,26 @@ static void npad_states(Cpu *c, uint32_t want) {
+-    int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
++    int is_pad = enabled && (id == pad_id() || id == 0 || id == 0x20);
+     plat_mutex_unlock(&lock);
+-    if (live) {
++    if (is_pad) {
+         s.attributes = ATTR_CONNECTED;
          input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
++        if (s.buttons) {
++            static int32_t btn_logged;
++            if (!plat_xchg32(&btn_logged, 1)) {
++                rt_log("hid: first active button delivered to game: %#llx (id %#x, want %#x)",
++                       (unsigned long long)s.buttons, id, want);
++            }
++        }
      }
      *out = s;
 +}
@@ -1323,10 +1608,11 @@ index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497
  }
  static void ov_states_full_key(Cpu *c) { npad_states(c, STYLE_FULL_KEY); }
  static void ov_states_handheld(Cpu *c) { npad_states(c, STYLE_HANDHELD); }
- static void ov_states_joycon(Cpu *c) { npad_states(c, 0); }
+-static void ov_states_joycon(Cpu *c) { npad_states(c, 0); }
++static void ov_states_joycon(Cpu *c) { npad_states(c, 4); }
 +static void ov_state_full_key(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), STYLE_FULL_KEY); }
 +static void ov_state_handheld(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), STYLE_HANDHELD); }
-+static void ov_state_joycon(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), 0); }
++static void ov_state_joycon(Cpu *c) { npad_fill(arg_p(c, 0), *need_id(c, 1, "GetNpadState"), 4); }
 +
 +// StreamPlay keeps the requested feature mask even when there are no remote controllers.
 +static volatile int32_t streamplay_features;
@@ -1335,7 +1621,7 @@ index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497
  
  // void SetNpadJoyHoldType(NpadJoyHoldType type)
  static void ov_hold_type(Cpu *c) {
-@@ -490,15 +507,21 @@ static void ov_touch_init(Cpu *c) {
+@@ -490,15 +524,21 @@ static void ov_touch_init(Cpu *c) {
      once(&logged, "hid: the game initialized the touch screen (none on this host)", 0);
  }
  
@@ -1360,7 +1646,7 @@ index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497
  
  // void SetNpadJoyAssignmentModeDual(const NpadIdType &), SetNpadJoyAssignmentModeSingle(const NpadIdType &,
  // NpadJoyDeviceType), Result MergeSingleJoyAsDualJoy(const NpadIdType &, const NpadIdType &): the host's one pad is
-@@ -512,20 +535,45 @@ HOST_OVERRIDE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS
+@@ -512,20 +552,45 @@ HOST_OVERRIDE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS
  HOST_OVERRIDE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", ov_vib_init);
  HOST_OVERRIDE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", ov_vib_info);
  HOST_OVERRIDE("_ZN2nn3hid21InitializeTouchScreenEv", ov_touch_init);
@@ -1407,10 +1693,10 @@ index 1f31deff567911be2b46881721c443a4ccc630b7..ec218866ac29df4746c284c9b5f98497
  HOST_OVERRIDE("_ZN2nn3hid14DisconnectNpadERKj", ov_disconnect);
  HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
 diff --git a/runtime/ov_media.c b/runtime/ov_media.c
-index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297db693f8a7 100644
+index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..3b6a039ef51f7ec99fb0f9eeda72cf1ad8faf65e 100644
 --- a/runtime/ov_media.c
 +++ b/runtime/ov_media.c
-@@ -5,6 +5,7 @@
+@@ -5,14 +5,34 @@
  #include <stdint.h>
  #include <limits.h>
  #include <stdlib.h>
@@ -1418,7 +1704,10 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
  
  #include <opus/opus.h>
  
-@@ -13,6 +14,23 @@
+ #include "host.h"
+ #include "platform/platform.h"
++#include "cfg.h"
++#include <SDL3/SDL.h>
  
  #define CODEC_R_INVALID 0x1fcd1u   // MacNativeGames' "invalid argument" result for nn::codec
  #define OPUS_WORK_SIZE 0x9000u     // what the game is told to reserve: libopus stereo decoder state (about 26 KiB) plus 4 KiB
@@ -1442,7 +1731,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
  
  // One record per initialised decoder object (the guest's HardwareOpusDecoderType). The registry lock only guards the
  // list; a decoder's own lock serialises its libopus state, so different streams decode in parallel. Lock order:
-@@ -22,10 +40,14 @@ typedef struct Decoder {
+@@ -22,10 +42,14 @@ typedef struct Decoder {
      uint64_t guest;
      OpusDecoder *dec;
      int rate, channels;
@@ -1457,7 +1746,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
  static PlatMutex lock = PLAT_MUTEX_INIT;
  
  static int valid_format(int rate, int channels) {
-@@ -33,11 +55,16 @@ static int valid_format(int rate, int channels) {
+@@ -33,11 +57,16 @@ static int valid_format(int rate, int channels) {
             (channels == 1 || channels == 2);
  }
  
@@ -1476,7 +1765,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
      if (d) plat_mutex_lock(&d->use);
      plat_mutex_unlock_shared(&lock);
      if (!d) rt_fatal("nn::codec::%s: unknown hardware Opus decoder %#llx", fn, (unsigned long long)guest);
-@@ -46,6 +73,23 @@ static Decoder *acquire(uint64_t guest, const char *fn) {
+@@ -46,6 +75,23 @@ static Decoder *acquire(uint64_t guest, const char *fn) {
  
  static void release(Decoder *d) { plat_mutex_unlock(&d->use); }
  
@@ -1500,7 +1789,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
  static OpusDecoder *opus_new(int rate, int channels) {
      int err = 0;
      OpusDecoder *o = opus_decoder_create(rate, channels, &err);
-@@ -67,10 +111,11 @@ static void ov_initialize(Cpu *c) {
+@@ -67,10 +113,11 @@ static void ov_initialize(Cpu *c) {
      if (!guest || !valid_format(rate, channels) || size < OPUS_WORK_SIZE) { ret_x(c, CODEC_R_INVALID); return; }
      OpusDecoder *fresh = opus_new(rate, channels);
      plat_mutex_lock(&lock);
@@ -1514,7 +1803,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
          OpusDecoder *old = d->dec;
          d->dec = fresh;
          d->rate = rate;
-@@ -102,9 +147,11 @@ static void ov_finalize(Cpu *c) {
+@@ -102,9 +149,11 @@ static void ov_finalize(Cpu *c) {
      if (!*p) rt_fatal("nn::codec::FinalizeHardwareOpusDecoder: unknown decoder %#llx", (unsigned long long)guest);
      Decoder *d = *p;
      plat_mutex_lock(&d->use);   // a decode in flight finishes first; the registry lock keeps new ones out
@@ -1526,7 +1815,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
      free(d);
  }
  
-@@ -125,14 +172,195 @@ static void ov_channel_count(Cpu *c) {
+@@ -125,14 +174,195 @@ static void ov_channel_count(Cpu *c) {
  
  // Result ResetHardwareOpusDecoder(HardwareOpusDecoderType *d)
  static void ov_reset(Cpu *c) {
@@ -1723,7 +2012,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
  // Result DecodeOpusInterleavedWithHardware(HardwareOpusDecoderType *d, size_t *consumed, int *samples, int16_t *out,
  // size_t out_size, const void *in, size_t in_size). The input is Nintendo's frame: an 8-byte big-endian header
  // {payload size, final range} and the Opus packet. A header range of 0 is not a recorded value (some encoders write 0
-@@ -173,3 +401,173 @@ HOST_OVERRIDE("_ZN2nn5codec32GetHardwareOpusDecoderSampleRateEPKNS0_23HardwareOp
+@@ -173,3 +403,222 @@ HOST_OVERRIDE("_ZN2nn5codec32GetHardwareOpusDecoderSampleRateEPKNS0_23HardwareOp
  HOST_OVERRIDE("_ZN2nn5codec34GetHardwareOpusDecoderChannelCountEPKNS0_23HardwareOpusDecoderTypeE", ov_channel_count);
  HOST_OVERRIDE("_ZN2nn5codec24ResetHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", ov_reset);
  HOST_OVERRIDE("_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm", ov_decode);
@@ -1739,12 +2028,13 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +HOST_OVERRIDE("_ZN2nn5codec49GetHardwareOpusDecoderExecutingDecodeRequestCountEPKNS0_23HardwareOpusDecoderTypeE", ov_opus_executing);
 +HOST_OVERRIDE("_ZN2nn5codec49GetHardwareOpusDecoderCompletedDecodeRequestCountEPKNS0_23HardwareOpusDecoderTypeE", ov_opus_completed);
 +
-+// SDK 21's virtual output stream runs as a timed sink. It preserves frame capacity and
-+// the stopped/started states so Wwise can pace the mixer during a headless boot.
++// SDK 21's virtual output stream runs as a timed sink and routes to SDL3 audio output.
 +enum { STREAM_STOPPED = 1, STREAM_STARTED = 2 };
 +typedef struct OutputStream {
 +    uint64_t guest, event, last_ns;
 +    int rate, capacity, queued, state;
++    int format, channels;
++    SDL_AudioStream *stream;
 +    struct OutputStream *next;
 +} OutputStream;
 +static OutputStream *streams;
@@ -1788,11 +2078,32 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +    OutputStream *s = calloc(1, sizeof *s);
 +    if (!s) rt_fatal("nn::audio: output stream allocation");
 +    if (event) kern_bind_system_event(c, event, 1);
-+    *s = (OutputStream){.guest = guest, .event = event, .rate = 48000, .capacity = capacity,
++    int rate = fmt[2] ? fmt[2] : 48000;
++    *s = (OutputStream){.guest = guest, .event = event, .rate = rate, .capacity = capacity,
++                        .format = fmt[0], .channels = fmt[1],
 +                        .state = STREAM_STOPPED, .next = streams};
++
++    const char *mode = cfg_get("TOTK_AUDIO");
++    if (!((mode && !strcmp(mode, "none")) || cfg_get("TOTK_AUDIO_OFF"))) {
++        if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
++            SDL_AudioFormat sdl_fmt = (fmt[0] == 5) ? SDL_AUDIO_F32 : SDL_AUDIO_S16;
++            SDL_AudioSpec spec = {sdl_fmt, fmt[1], rate};
++            s->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
++            if (s->stream) {
++                const char *dname = SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(s->stream));
++                rt_log("audio: output stream device '%s' opened (%s, %d channels, %d Hz)",
++                       dname ? dname : "default",
++                       fmt[0] == 5 ? "F32" : "S16", fmt[1], rate);
++            } else {
++                rt_log("audio: failed to open audio device stream (%s)", SDL_GetError());
++            }
++        }
++    }
++
 +    streams = s;
 +    plat_mutex_unlock(&stream_lock);
-+    rt_log("audio: virtual output stream, timed sink (%d channels, %d frames)", fmt[1], capacity);
++    rt_log("audio: virtual output stream (%s, %d channels, %d frames)",
++           fmt[0] == 5 ? "F32" : "S16", fmt[1], capacity);
 +    ret_x(c, 0);
 +}
 +static void ov_stream_open(Cpu *c) { stream_open(c, 1); }
@@ -1803,6 +2114,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +    if (s->state == STREAM_STOPPED) {
 +        s->state = STREAM_STARTED;
 +        s->last_ns = kern_now_ns();
++        if (s->stream) SDL_ResumeAudioStreamDevice(s->stream);
 +        if (s->event) kern_signal_system_event(s->event);
 +    }
 +    return 1;
@@ -1827,13 +2139,21 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +static void ov_stream_stop(Cpu *c) {
 +    plat_mutex_lock(&stream_lock);
 +    OutputStream *s = stream_find(arg_x(c, 0));
-+    if (s) { stream_drain(s); s->state = STREAM_STOPPED; }
++    if (s) {
++        stream_drain(s);
++        s->state = STREAM_STOPPED;
++        if (s->stream) SDL_PauseAudioStreamDevice(s->stream);
++    }
 +    plat_mutex_unlock(&stream_lock);
 +}
 +static void ov_stream_purge(Cpu *c) {
 +    plat_mutex_lock(&stream_lock);
 +    OutputStream *s = stream_find(arg_x(c, 0));
-+    if (s) { s->queued = 0; s->last_ns = kern_now_ns(); }
++    if (s) {
++        s->queued = 0;
++        s->last_ns = kern_now_ns();
++        if (s->stream) SDL_ClearAudioStream(s->stream);
++    }
 +    plat_mutex_unlock(&stream_lock);
 +}
 +static void ov_stream_close(Cpu *c) {
@@ -1845,6 +2165,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +        OutputStream *s = *link;
 +        *link = s->next;
 +        kern_forget_system_event(s->event);
++        if (s->stream) SDL_DestroyAudioStream(s->stream);
 +        free(s);
 +    }
 +    plat_mutex_unlock(&stream_lock);
@@ -1868,15 +2189,32 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +static void ov_stream_filled(Cpu *c) { stream_frames(c, 1); }
 +static void ov_stream_write(Cpu *c) {
 +    int frames = (int)arg_x(c, 2);
++    const void *data = arg_p(c, 1);
 +    plat_mutex_lock(&stream_lock);
 +    OutputStream *s = stream_find(arg_x(c, 0));
 +    if (s) stream_drain(s);
-+    if (s && arg_x(c, 1) && frames > 0 && frames <= s->capacity - s->queued) s->queued += frames;
-+    else frames = 0;
++    if (s && data && frames > 0 && frames <= s->capacity - s->queued) {
++        s->queued += frames;
++        if (s->stream) {
++            int frame_bytes = s->channels * (s->format == 5 ? sizeof(float) : sizeof(int16_t));
++            SDL_PutAudioStreamData(s->stream, data, frames * frame_bytes);
++        }
++    } else {
++        frames = 0;
++    }
 +    plat_mutex_unlock(&stream_lock);
 +    ret_x(c, frames);
 +}
-+static void ov_stream_gain(Cpu *c) { (void)c; }  // a silent sink has no gain
++static void ov_stream_gain(Cpu *c) {
++    uint64_t guest = arg_x(c, 0);
++    float gain = arg_s(c, 0);
++    plat_mutex_lock(&stream_lock);
++    OutputStream *s = stream_find(guest);
++    if (s && s->stream) {
++        SDL_SetAudioStreamGain(s->stream, gain);
++    }
++    plat_mutex_unlock(&stream_lock);
++}
 +static void ov_stream_stats(Cpu *c) {
 +    void *out = (void *)(uintptr_t)c->x[8];
 +    if (out) memset(out, 0, 24);
@@ -1898,7 +2236,7 @@ index 6e0bd03ebd348b41b05f50b3ac25bf131cf3a60c..51a2ba0d44399a36106dc8e296b3297d
 +HOST_OVERRIDE("_ZN2nn5audio19SetOutputStreamGainEPNS0_16OutputStreamTypeEfNS_8TimeSpanE", ov_stream_gain);
 +HOST_OVERRIDE("_ZN2nn5audio25GetOutputStreamStatisticsEPNS0_16OutputStreamTypeEb", ov_stream_stats);
 diff --git a/runtime/ov_system.c b/runtime/ov_system.c
-index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..044e5d77d257c791f99a4a585da0d901907e6181 100644
+index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..454b6e0edfe7c9b069523cbed0c6e983de001eb9 100644
 --- a/runtime/ov_system.c
 +++ b/runtime/ov_system.c
 @@ -121,6 +121,37 @@ static void ov_desired_language(Cpu *c) {
@@ -1968,7 +2306,80 @@ index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..044e5d77d257c791f99a4a585da0d901
  // void err::ShowError(Result): the game's error dialog, logged
  static void ov_show_error(Cpu *c) {
      uint32_t r = (uint32_t)arg_x(c, 0);
-@@ -808,16 +861,64 @@ static void ov_graphics_scale(Cpu *c) { ret_x(c, 2); }
+@@ -481,6 +534,72 @@ static void ov_nickname(Cpu *c) {
+     ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
+ }
+ 
++// Result ListOpenUsers(int *pOutActualLength, Uid *pOutUsers, int bufferLength)
++static void ov_list_open_users(Cpu *c) {
++    int *count = arg_p(c, 0);
++    Uid *users = arg_p(c, 1);
++    int max = (int)arg_x(c, 2);
++    plat_mutex_lock(&account_lock);
++    load_uid();
++    if (count) *count = (max > 0) ? 1 : 0;
++    if (users && max > 0) users[0] = local;
++    plat_mutex_unlock(&account_lock);
++    ret_x(c, 0);
++}
++
++// Result ListQualifiedUsers(int *pOutActualLength, Uid *pOutUsers, int bufferLength)
++static void ov_list_qualified_users(Cpu *c) {
++    int *count = arg_p(c, 0);
++    Uid *users = arg_p(c, 1);
++    int max = (int)arg_x(c, 2);
++    plat_mutex_lock(&account_lock);
++    load_uid();
++    if (count) *count = (max > 0) ? 1 : 0;
++    if (users && max > 0) users[0] = local;
++    plat_mutex_unlock(&account_lock);
++    ret_x(c, 0);
++}
++
++// Result ListAllUsers(int *pOutActualLength, Uid *pOutUsers, int bufferLength)
++static void ov_list_all_users(Cpu *c) {
++    int *count = arg_p(c, 0);
++    Uid *users = arg_p(c, 1);
++    int max = (int)arg_x(c, 2);
++    plat_mutex_lock(&account_lock);
++    load_uid();
++    if (count) *count = (max > 0) ? 1 : 0;
++    if (users && max > 0) users[0] = local;
++    plat_mutex_unlock(&account_lock);
++    ret_x(c, 0);
++}
++
++// Result GetUserCount(int *pOut)
++static void ov_user_count(Cpu *c) {
++    int *count = arg_p(c, 0);
++    if (count) *count = 1;
++    ret_x(c, 0);
++}
++
++// Result OpenUser(UserHandle *out, const Uid &uid)
++static void ov_open_user_by_uid(Cpu *c) {
++    UserHandle *out = arg_p(c, 0);
++    const Uid *uid = arg_p(c, 1);
++    plat_mutex_lock(&account_lock);
++    load_uid();
++    int ok = 0;
++    if (out && (!uid || same_uid(uid))) {
++        for (int i = 0; i < 64 && !ok; i++) {
++            if (!tokens[i]) {
++                tokens[i] = next_token++;
++                *out = (UserHandle){local, tokens[i]};
++                ok = 1;
++            }
++        }
++    }
++    plat_mutex_unlock(&account_lock);
++    ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
++}
++
+ // ==== nn::time (time_host.c): the host clock and time zone. User and network clocks follow the host wall clock; the
+ // steady clock counts seconds since Windows started, with one random source id per process. ClockSnapshot has the
+ // public 0xD0-byte layout, because game code reads its fields through inline accessors.
+@@ -808,16 +927,64 @@ static void ov_graphics_scale(Cpu *c) { ret_x(c, 2); }
  static void ov_graphics_scale_notify(Cpu *c) { (void)c; }
  // void nn::oe::SetAlbumImageOrientation(album::ImageOrientation): there is no capture album
  static void ov_album_orientation(Cpu *c) { (void)c; }
@@ -2033,7 +2444,63 @@ index dc5a67926cb3f9e5a8b40569b8641b2a3699e02e..044e5d77d257c791f99a4a585da0d901
  HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
  HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
  HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);
-@@ -1079,3 +1180,4 @@ HOST_OVERRIDE("_ZN2nn6socket4PollEP6pollfdmi", ov_socket_poll);
+@@ -884,6 +1051,11 @@ HOST_OVERRIDE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", ov_user_
+ HOST_OVERRIDE("_ZN2nn7account17GetLastOpenedUserEPNS0_3UidE", ov_last_opened_user);
+ HOST_OVERRIDE("_ZN2nn7account16GetUserExistenceEPbRKNS0_3UidE", ov_user_existence);
+ HOST_OVERRIDE("_ZN2nn7account11GetNicknameEPNS0_8NicknameERKNS0_3UidE", ov_nickname);
++HOST_OVERRIDE("_ZN2nn7account13ListOpenUsersEPiPNS0_3UidEi", ov_list_open_users);
++HOST_OVERRIDE("_ZN2nn7account18ListQualifiedUsersEPiPNS0_3UidEi", ov_list_qualified_users);
++HOST_OVERRIDE("_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi", ov_list_all_users);
++HOST_OVERRIDE("_ZN2nn7account12GetUserCountEPi", ov_user_count);
++HOST_OVERRIDE("_ZN2nn7account8OpenUserEPNS0_10UserHandleERKNS0_3UidE", ov_open_user_by_uid);
+ 
+ HOST_OVERRIDE("_ZN2nn4time10InitializeEv", ov_time_initialize);
+ HOST_OVERRIDE("_ZN2nn4time8FinalizeEv", ov_time_finalize);
+@@ -912,6 +1084,43 @@ HOST_OVERRIDE("_ZN2nn2pl17GetSharedFontSizeENS0_14SharedFontTypeE", ov_font_size
+ static void ov_aoc_none(Cpu *c) { ret_x(c, 0); }
+ HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_none);
+ 
++// Switch 2 nn::camera stubs for Star Fox Arwing cockpit
++static void ov_camera_init(Cpu *c) {
++    rt_log("camera: nn::camera::Initialize() -> stub ok");
++    ret_x(c, 0);
++}
++static void ov_camera_finalize(Cpu *c) {
++    rt_log("camera: nn::camera::Finalize() -> stub ok");
++    ret_x(c, 0);
++}
++static void ov_camera_available(Cpu *c) {
++    ret_x(c, 0); // 0: no hardware camera connected; use standard Fox McCloud Arwing model
++}
++static void ov_camera_open(Cpu *c) {
++    uint32_t *out = arg_p(c, 0);
++    if (out) *out = 0;
++    ret_x(c, 0x1404); // Not connected
++}
++static void ov_camera_event(Cpu *c) {
++    uint64_t ev = arg_x(c, 0);
++    if (ev) kern_bind_system_event(c, ev, 0);
++    ret_x(c, 0);
++}
++static void ov_gs_check_init(Cpu *c) {
++    ret_x(c, 0);
++}
++HOST_OVERRIDE("_ZN2nn6camera10InitializeEv", ov_camera_init);
++HOST_OVERRIDE("_ZN2nn6camera8FinalizeEv", ov_camera_finalize);
++HOST_OVERRIDE("_ZN2nn6camera11IsAvailableEv", ov_camera_available);
++HOST_OVERRIDE("_ZN2nn6camera8ActivateEv", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn6camera10DeactivateEv", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn6camera21QueryDeviceConnectionERKNS0_13DeviceRequestE", ov_camera_available);
++HOST_OVERRIDE("_ZN2nn6camera10OpenCameraEPNS0_12DeviceHandleERKNS0_13DeviceRequestE", ov_camera_open);
++HOST_OVERRIDE("_ZN2nn6camera11CloseCameraENS0_12DeviceHandleE", ov_result_ok);
++HOST_OVERRIDE("_ZN2nn6camera31GetDeviceConnectionChangedEventEPNS_2os15SystemEventTypeE", ov_camera_event);
++HOST_OVERRIDE("_ZN2nn6camera16GetDetachedEventEPNS_2os15SystemEventTypeENS0_12DeviceHandleE", ov_camera_event);
++HOST_OVERRIDE("_ZN2nn2gs3sdk30CheckGraphicsSystemInitializedEPKcm", ov_gs_check_init);
++
+ // LOCAL TEST (Ocarina): the game's decoders and parsers leave through longjmp on bad input, which is ordinary flow for them.
+ // Lifted functions keep their state on the host stack, so setjmp also keeps a copy of the host stack above it: longjmp puts
+ // the bytes back and returns from setjmp a second time, through the same frames, into the lifted caller. Guest memory is
+@@ -1079,3 +1288,4 @@ HOST_OVERRIDE("_ZN2nn6socket4PollEP6pollfdmi", ov_socket_poll);
  HOST_OVERRIDE("_ZN2nn6socket6detail4PollEPNS0_6PollFdEmi", ov_socket_poll);
  HOST_OVERRIDE("_ZN2nn6socket6detail4PollEP6pollfdmi", ov_socket_poll);
  
@@ -2073,7 +2540,7 @@ index acd8a67c088c38d9919e1a3bc0aa44b09d0f7ca1..47e212f1a3010d99da7317a76db90067
          vk_pipeline_save();
          prof_write();
 diff --git a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-index c92cd68134caf7ca53ab48118a125b969489a3e3..f4cf00a5e44ad4c66ac15869a1ddf5cc484900d8 100644
+index c92cd68134caf7ca53ab48118a125b969489a3e3..89e813351cb45495f2f5f56498fbd4f965947bfd 100644
 --- a/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 +++ b/runtime/third_party/eglantine/shader_recompiler/frontend/ampere/lower_to_maxwell.h
 @@ -122,7 +122,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
@@ -2085,6 +2552,28 @@ index c92cd68134caf7ca53ab48118a125b969489a3e3..f4cf00a5e44ad4c66ac15869a1ddf5cc
              return instruction.Bits(16, 8) == 255 ? 0U : 1U;
          case 0x225: case 0x625: case 0x825:
              return 2;
+@@ -1588,18 +1588,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                  (u64{operation} << 29) | (u64{dimension} << 33) | (u64{offset} << 36));
+             break;
+         }
+-        case 0x59f: { // SURED.D.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D.
++        case 0x59f: { // SURED.D.STRONG.GPU.IGN U32, direct descriptor, buffer or 2D or 3D.
+             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
+             const u32 dimension = insn.Bits(61, 3);
+-            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 || (dimension != 1 && dimension != 3) || binding >= 18 ||
++            if ((insn.words[2] & ~0x03800000U) != 0x0010e000 || (dimension != 1 && dimension != 3 && dimension != 5) || binding >= 18 ||
+                 offset > 0x1fff || insn.Bits(59, 2) || coordinate > 253)
+                 return fail(index, "native surface reduction mode");
+             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                 return fail(index, "native surface descriptor buffer conflict");
+             result.required_texture_buffer = binding;
+             // Maxwell SURED: operand 0-7, coordinates 8-15, op 24, U32 zero at 20,
+-            // type 33 (1 = buffer, 3 = 2D), bound offset 36, bound 51.
++            // type 33 (1 = buffer, 3 = 2D, 5 = 3D), bound offset 36, bound 51.
+             emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                 (u64{insn.Bits(87, 3)} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+             break;
 @@ -3148,6 +3148,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
                   (u64{insn.Bits(76, 2)} << 52) | (u64{insn.Bits(78, 1)} << 55));
              break;
