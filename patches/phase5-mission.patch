@@ -257,26 +257,59 @@ index fb2367933a0ba2718a13398a25830707c670a3a3..21b3caad8a368acda1b40364df03e628
  HOST_OVERRIDE(S_READ_OPTIONS, ov_read_options);
  HOST_OVERRIDE(S_READ_EXACT, ov_read_exact);
 diff --git a/runtime/gfx_window_win.c b/runtime/gfx_window_win.c
-index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..531e9afda965b6ee751a4802146ce283f38ed3d5 100644
+index b1f3f306b0dd9a8e8ec05747cf48f19d4da049e2..660df44303cd50b14d7834e7c1f2d84914ba7599 100644
 --- a/runtime/gfx_window_win.c
 +++ b/runtime/gfx_window_win.c
-@@ -312,7 +312,7 @@ static void window_main(void *arg) {
+@@ -294,6 +294,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+ 
+ static void window_main(void *arg) {
+     (void)arg;
++    // Attach to interactive desktop so window appears visibly on user's screen
++    HWINSTA hwinsta = OpenWindowStationA("WinSta0", FALSE, GENERIC_ALL);
++    if (hwinsta) SetProcessWindowStation(hwinsta);
++    HDESK hdesk = OpenDesktopA("Default", 0, FALSE, GENERIC_ALL);
++    if (!hdesk) hdesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
++    if (hdesk) {
++        if (SetThreadDesktop(hdesk)) {
++            rt_log("gfx: window thread attached to interactive desktop (Default)");
++        } else {
++            rt_log("gfx: SetThreadDesktop failed (%lu)", GetLastError());
++        }
++    }
+     HINSTANCE inst = GetModuleHandleW(NULL);
+     // Icon resource 1 of totk.rc (runtime/totk.ico): the title bar, the taskbar button and Alt+Tab.
+     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = wnd_proc, .hInstance = inst,
+@@ -306,13 +318,17 @@ static void window_main(void *arg) {
+     int cw, ch, ow, oh;
+     cfg_window_size(&cw, &ch);
+     outer_size(NULL, cw, ch, &ow, &oh);
++    int screen_w = GetSystemMetrics(SM_CXSCREEN);
++    int screen_h = GetSystemMetrics(SM_CYSCREEN);
++    int pos_x = (screen_w > ow) ? (screen_w - ow) / 2 : 0;
++    int pos_y = (screen_h > oh) ? (screen_h - oh) / 2 : 0;
+     // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
+     // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
+     // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
      // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
      // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
      int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
 -    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Ocarina Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
-+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Star Fox (Nintendo Switch 2)", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
++    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"Star Fox (Nintendo Switch 2)", WND_STYLE, pos_x, pos_y, ow, oh, NULL,
                               NULL, inst, NULL);
      if (!g_hwnd) {
          rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
-@@ -326,7 +326,9 @@ static void window_main(void *arg) {
+@@ -326,7 +342,13 @@ static void window_main(void *arg) {
          // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
          plat_xchg32(&g_dpi, (int32_t)GetDpiForWindow(g_hwnd));
          outer_size(g_hwnd, cw, ch, &ow, &oh);
 -        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
++        AllowSetForegroundWindow(ASFW_ANY);
 +        ShowWindow(g_hwnd, SW_SHOWNORMAL);
-+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, ow, oh, SWP_NOMOVE | SWP_SHOWWINDOW);
++        SetWindowPos(g_hwnd, HWND_TOP, pos_x, pos_y, ow, oh, SWP_SHOWWINDOW);
++        BringWindowToTop(g_hwnd);
 +        SetForegroundWindow(g_hwnd);
++        SetActiveWindow(g_hwnd);
++        SetFocus(g_hwnd);
          if (!background) {
              FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
              FlashWindowEx(&fw);
@@ -761,10 +794,20 @@ index 8e7aecd7ac23355e515022bac668197df6e36edd..d9494d1d11a8898bcb9eee022b6afb3b
          if (type == R_RELATIVE) {
              m->kinds[K_RELATIVE]++;
 diff --git a/runtime/main.c b/runtime/main.c
-index a32402c8f5d67c8ae57ad2021ca53fe8ec1baaf4..80de3816be50a62f2884a144ac7f838fc5f74a7c 100644
+index a32402c8f5d67c8ae57ad2021ca53fe8ec1baaf4..7a5347e820bc869ac0183ba10a374b46b737631f 100644
 --- a/runtime/main.c
 +++ b/runtime/main.c
-@@ -440,7 +440,7 @@ static int selftest(void) {
+@@ -22,6 +22,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ #include "cfg.h"
+ #include "host.h"
+@@ -440,7 +443,7 @@ static int selftest(void) {
  static int usage(const char *argv0) {
      fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--selftest | --probe-loader | "
                      "--probe-cfg | --probe-dpi | --probe-kernel | --probe-ipc | --probe-ipc-lifetime | --probe-services | --probe-fs | --probe-gfx-abi | "
@@ -773,7 +816,21 @@ index a32402c8f5d67c8ae57ad2021ca53fe8ec1baaf4..80de3816be50a62f2884a144ac7f838f
                      "--probe-vkexec | --probe-vkgeometry | --probe-vkgeometry-passthrough | --probe-vkgeometry-passthrough-ordering | --probe-vkclear | --probe-vkcopy-astc | --probe-vkpool | --probe-vkreset | --probe-astc | --probe-movie | --prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
      return 2;
  }
-@@ -516,7 +516,7 @@ int main(int argc, char **argv) {
+@@ -478,6 +481,13 @@ static void portable_paths(RtConfig *c) {
+ }
+ 
+ int main(int argc, char **argv) {
++#ifdef _WIN32
++    HWINSTA hwinsta = OpenWindowStationA("WinSta0", FALSE, GENERIC_ALL);
++    if (hwinsta) SetProcessWindowStation(hwinsta);
++    HDESK hdesk = OpenDesktopA("Default", 0, FALSE, GENERIC_ALL);
++    if (!hdesk) hdesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
++    if (hdesk) SetThreadDesktop(hdesk);
++#endif
+     mem_init();   // first: claim the guest address space before anything else can land there; reads totk.ini
+     setvbuf(stdout, NULL, _IONBF, 0);
+     setvbuf(stderr, NULL, _IONBF, 0);
+@@ -516,7 +526,7 @@ int main(int argc, char **argv) {
              return usage(argv[0]);
          }
      }
@@ -782,7 +839,7 @@ index a32402c8f5d67c8ae57ad2021ca53fe8ec1baaf4..80de3816be50a62f2884a144ac7f838f
      if (cfg.seconds && mode) return usage(argv[0]);
      log_open(!mode);
      if (!mode) {
-@@ -556,5 +556,13 @@ int main(int argc, char **argv) {
+@@ -556,5 +566,13 @@ int main(int argc, char **argv) {
      if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
      if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
      if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
