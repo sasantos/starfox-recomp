@@ -2617,7 +2617,7 @@ index 58e23d6720749914f41402c3bafb067018a1d98d..09fbd462bc3c9626e68a25c5844afb2a
          case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
              if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
 diff --git a/runtime/vk_exec_draw.c b/runtime/vk_exec_draw.c
-index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a65f71818813d548945d49c43e74114080a62797 100644
+index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..5f294727340debc576578e642730f669100ba3d0 100644
 --- a/runtime/vk_exec_draw.c
 +++ b/runtime/vk_exec_draw.c
 @@ -3599,12 +3599,14 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
@@ -2633,7 +2633,7 @@ index b0d0ef7bf4045597c8b3be1ae587c20e0f3d87a3..a65f71818813d548945d49c43e741140
 -    if (!find_stage(ex->prog, NVN_STAGE_CS, &bctl, &bcode, &blen) || nvn2_origin(bcode) != 0xfd029a317a9a4b94ull) return 0;
 +    if (!find_stage(ex->prog, NVN_STAGE_CS, &bctl, &bcode, &blen)) return 0;
 +    uint64_t org = nvn2_origin(bcode);
-+    if (org != 0xfd029a317a9a4b94ull && org != 0xe0aecd990ba0f86cull) return 0;
++    if (org != 0xfd029a317a9a4b94ull) return 0;
      static int on = -1;
      if (on < 0) {
          const char *e = getenv("TOTK_BIG_CS");
