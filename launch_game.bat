@@ -1,19 +1,22 @@
 @echo off
 title Star Fox Remake (Nintendo Switch 2 PC Recompilation)
+set "PATH=C:\msys64\ucrt64\bin;%PATH%"
+set "TOTK_INPUT_SCRIPT="
 cd /d "%~dp0build\phase1-base"
-set TOTK_INPUT_SCRIPT=..\test_input.txt
 echo ========================================================
 echo   Star Fox Remake (Nintendo Switch 2) - PC Recompilation
 echo ========================================================
 echo   Controles:
-echo     - Gamepad: DualSense (detectado), Xbox ou Pro Controller
+echo     - Gamepad: DualSense, Xbox ou Pro Controller
 echo     - Teclado:
 echo         WASD : Mover Arwing
 echo         E    : Confirmar / Tiro (Botao A)
 echo         Shift: Freio / Cancelar (Botao B)
 echo         Espaco: Botao X
-echo         Tab  : Menu / Pausar / Pular (Botao Plus)
-echo         Q / R: Manobras / Rolar (Botoes L / R)
+echo         Tab  : Menu do Jogo / Pausar (Botao Plus)
+echo         F1 / Esc: Menu de Configuracoes do Port
+echo         F10  : Mostrar / Alternar Overlay de FPS
+echo         F11  : Tela Cheia (Fullscreen)
 echo ========================================================
 starfox.exe --profile "..\phase1-profile"
 pause
