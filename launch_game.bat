@@ -2,6 +2,8 @@
 title Star Fox Remake (Nintendo Switch 2 PC Recompilation)
 set "PATH=C:\msys64\ucrt64\bin;%PATH%"
 set "TOTK_INPUT_SCRIPT="
+set "TOTK_XLATE=%~dp0build\phase1-base\totk_xlate.exe"
+set "TOTK_ROMFS=%~dp0build\extracted\base-00000000\romfs"
 cd /d "%~dp0build\phase1-base"
 echo ========================================================
 echo   Star Fox Remake (Nintendo Switch 2) - PC Recompilation
